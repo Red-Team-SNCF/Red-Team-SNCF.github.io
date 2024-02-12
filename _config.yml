@@ -25,7 +25,7 @@ highlight_theme: syntax-base16.monokai.dark # select a dark theme for the code h
 
 # Author settings
 author: Red Team SNCF # add your name
-author-pic: Myself_Neon_grey.jpg
+author-pic: /assets/img/branding/SNCF.png
 about-author: SNCF has a red team to assess the security level of the different information systems in the group.
 
 # Contact links
