@@ -12,9 +12,8 @@ github:  Red-Team-SNCF/Complete-Process-Hollowing
 mathjax: yes
 ---
 
-# How to perform a Complete Process Hollowing
 
-## Table of Content
+# Table of Content
 
 * [Abstract](#abstract)
 * [Basic Process Hollowing](#basic-process-hollowing)
@@ -40,7 +39,7 @@ mathjax: yes
 * [Plot Twist](#plot-twist)
 * [References](#references)
 
-## Abstract
+# Abstract
 
 When someone is interested  in code injection, he encounters Process Hollowing technic which consists in creating a remote process in a suspended state, write a payload in the remote process memory and overwrite the address of entry point with the address of the payload. A lot of articles on internet explain really well how the technique works and how to implement it in C/C++ using a PE as a payload.  
 
@@ -48,13 +47,13 @@ However, all the articles about this technique lack one specific thing: handling
 
 This article does not show a new evasion technic but an improvement of an old technic used to inject PE in a remote process.
 
-## Basic Process Hollowing
+# Basic Process Hollowing
 
 This first section is a reminder of how to implement basic process hollowing with a PE without any IAT such as a meterpreter or Havoc payload. The article will not go into deep details about the basic process hollowing process since there are a lot of articles which explains better the technic. I suggest to read the article from [ired.team about process hollowing](https://www.ired.team/offensive-security/code-injection-process-injection/process-hollowing-and-pe-image-relocations) if you want to have more details about the basics.  
 For people who already knows about the process hollowing, I suggest to directly jump to [Make the remote process load the libraries required
 ](#make-the-remote-process-load-the-required-libraries) chapter.
 
-### Definition
+## Definition
 
 Process Hollowing is an injection technique that injects PE payloads into the address space of a remote process. The remote process is often a legitimate process created by the process hollowing implementation.
 
@@ -66,7 +65,7 @@ However, in this article we won't unmap the legitimate process image because:
 
 ![Process Hollowing](assets/img/posts/20240124/ProcessHollowSchema.png)
 
-### Start a suspended process
+## Start a suspended process
 
 The first step is pretty straightforward. It is to create a process in a suspended state. The process needs to have the same architecture as the PE that we want to inject.(x64 PE on x64 process, x86 PE on x86 process, etc.). For the blog post the executable that will be used as the legitimate process will be `svchost.exe`.  
 To create the process, the WinAPI function `CreateProcessA` will be used. A little function, which will juste take as arguments, our process name that we want to execute and a pointer to a process information struct which will be initialiazed by the function `CreateProcessA`, will be created. The process information structure `pi` is used to retrieve the process handle and the main thread handle.
@@ -98,7 +97,7 @@ int main()
 {% endhighlight %}
 
 
-### LoadPE and Retrieve NT Headers 
+## LoadPE and Retrieve NT Headers 
 
 For the article, a function to read a PE file from disk and to load it in a byte array is used. Alternatives can be done such as:
 * embed the PE as a byte array in our code
@@ -167,7 +166,7 @@ BOOL retrieveNtHeader(PIMAGE_NT_HEADERS& ntHeader, LPVOID peContent)
 }
 {% endhighlight %}
 
-### Allocate Memory 
+## Allocate Memory 
 
 Once the suspended process is created and the NT Header retrieved, we need to allocate memory on the remote process to store the payload.  
 The size of the injected PE image will be used to allocate memory.
@@ -189,7 +188,7 @@ DWORD64 DeltaImageBase = (DWORD64)allocAddrOnTarget - peInjectNtHeader->Optional
 
 On most articles, the allocation is performed on the Image base Address of the legitimate process after beeing unmapped. However it has been preferred to not touch the original memory of process and let the operating system decide where the allocation will be made because, to load missing libraries of the injected PE into the remote process, it is needed to create remote threads. The process crashes when we attempt to create a remote thread when the remote process Image is unmapped. Therefore, it is needed to let untouched the original Image.  
 
-### Copy PE in target process
+## Copy PE in target process
 
 Once the memory has been allocated, it is possible to copy our PE in the target process.  
 In a first time, it is required to update the ImageBase address in the NT Header with the address of the allocated memory. Once done, the injected PE headers will be copied  in our newly allocated memory.  
@@ -247,7 +246,7 @@ BOOL copyPEinTargetProcess(HANDLE pHandle, LPVOID& allocAddrOnTarget, LPVOID peT
 ![Copy of PE in the remote process](assets/img/posts/20240124/CopyPEOutput.png)
 
 
-### Image base Relocation
+## Image base Relocation
 
 Since the PE was loaded to a different address of the image base address referenced in the NT header, it needs to be patched in order for the binary to resolve addresses of different objects like static variables and other absolute addresses which otherwise would no longer work. The way the windows loader knows how to patch the images in memory is by referring to a relocation table residing in the binary.  
 
@@ -310,7 +309,7 @@ BOOL fixRelocTable(HANDLE pHandle, PIMAGE_SECTION_HEADER peToInjectRelocSection,
 {% endhighlight %}
 ![Relocation phase](assets/img/posts/20240124/Reloc.png)
 
-### Changing the entrypoint and resuming the execution
+## Changing the entrypoint and resuming the execution
 
 After the relocation phase done. The last step is to change the address of the register RCX of the remote process thread context with the address of the entrypoint of the injected PE. Also it is needed to change the address of the Image Base Address included in the PEB which is contained in the RDX register.
 
@@ -360,9 +359,9 @@ We now need to resolve the mimikatz IAT to be able to execute it without any cra
 
 ![Mimiaktz IAT](assets/img/posts/20240124/mimikatzIAT.png)
 
-## Make the remote process load the required libraries 
+# Make the remote process load the required libraries 
 
-### Load an arbitrary DLL in a remote process
+## Load an arbitrary DLL in a remote process
 
 Having established a basic process hollowing code, our objective is to enhance it to be able to load any PE. We will use the binary `mimikatz` as our injected PE, while maintaining the `svchost` binary as the remote process into which we intend to inject `mimikatz`.
 
@@ -408,7 +407,7 @@ But if we call our function, we will observe that `winhttp.dll` will be sucessfu
 
 The other loaded dll are the libraries needed by the legitimate `svchost` process.
 
-### Resolve injected PE IAT to make the remote process load all the dependencies
+## Resolve injected PE IAT to make the remote process load all the dependencies
 
 Now that we have a method to make the remote process load arbitrary DLLs, we now need to parse our injected PE to retrieve all its dependancies.  
 When a PE is loaded, there is a difference in addresses between the PE on the disk and the PE in memory. For example, when we copy our PE sections, we retrieve the section through the attribute `PointerToRawData` but the destination use the attribute `VirtualAddress`. When we open our binary in `PE Bear`, we can easily observe that there is a difference in the section mapping when it is on the disk and when it is loaded in memory.  
@@ -537,9 +536,9 @@ Now let's check if our process has successfuly loaded `mimikatz` dependencies.
 
 We can observe that our process has loaded all mimikatz dependencies. Now let's find a way to find the libraries base address in our code to be able to fix the IAT addresses.
 
-## Resolve the functions and libraries addresses on the remote process
+# Resolve the functions and libraries addresses on the remote process
 
-### Retrieve the libraries and function addresses
+## Retrieve the libraries and function addresses
 
 Now that we have our remote process with `mimikatz` dependancies loaded, we need to retrieve the address of the functions referenced in the IAT to be able to patch it. Otherwise, the pointers of the DLL imports will point to incorrect addresses.  
 
@@ -730,9 +729,9 @@ Let's write a little C code to perform `D/Invoke` on the function `LsaConnectUnt
 We can observe that despite using a `HANDLE` on `Secur32.dll`, the address of `LsaConnectUntrusted` is located in the library `sspicli.dll`.  
 It is what we call a `Forwarded Function`. It is an exported function of `Secur32.dll` but which is forwarded to the library `sspicli.dll`. 
 
-## Handle forwarded functions on remote process
+# Handle forwarded functions on remote process
 
-### Definition of a forwarded function
+## Definition of a forwarded function
 
 First let's define what is a forwarded function.  
 In the context of dynamic-link libraries (DLLs), a forwarded function refers to a function that is not directly implemented within the DLL itself but is instead provided by another DLL. When a program calls a forwarded function in a DLL, the control is transferred to the corresponding function in another DLL.  
@@ -751,7 +750,7 @@ Here is a simplified example to illustrate how a forwarded function might be set
     * Calls a function from A.dll, including the forwarded function.
     * When the forwarded function is called, control is transferred to B.dll, where the actual implementation resides.
 
-### Custom GetProcAddress
+## Custom GetProcAddress
 
 To be able to determine if a function is a forwarded function, we need to implement a custom `GetProcAddress` function which will return the forwarded library name and the forwarded function name if we are in the context of a forwarded function.   
 
@@ -949,9 +948,9 @@ Let's look at it in a standalone code with a debugger.
 As we can see, we loaded the `api-ms-win-core-com-l1-1-0.dll` library, however the debugger indicates us that it is in reality the library `combase.dll`.  
 It's a mechanism created by Microsoft called the API Sets.
 
-## Handle API set
+# Handle API set
 
-### Definition of API Sets 
+## Definition of API Sets 
 
 API sets, also known as API set namespaces, are a concept introduced in Windows operating systems to help manage the evolution of the Windows API (Application Programming Interface) and provide a layer of abstraction for developers. API sets play a role in versioning and maintaining compatibility between different versions of Windows.  
 Windows implemented this in order to seperate functionalities through virtual names. It is also used to maintain compatibility across different Windows Versions.  
@@ -959,7 +958,7 @@ You can find more details about it: [Documentation Windows on API Sets](https://
 
 To sum up, API sets are names that are used as proxy for real DLLs. For our example `api-ms-win-core-com-l1-1-0.dll` is a proxy name for the dll `combase.dll`.  
 
-### How to resolve API set names
+## How to resolve API set names
 
 When we look at the PEB structure referenced on [Geoff Chappell website](https://www.geoffchappell.com/studies/windows/km/ntoskrnl/inc/api/pebteb/peb/index.htm), we can observe that at the offset 0x68 we have a pointer to an attribute called `ApiSetMap`. This is where we can find the mapping of the API sets. However, when we look at the structure from `winternl.h`, we can see that the attribute is not referenced. By performing several tests and calculation, we can find that the `ApiSetMap` corresponds to the attribute: `(PPEB)->Reserved9[0]`. 
 
@@ -1135,7 +1134,7 @@ bool launchSusprendedProcess(LPSTR processName, LPPROCESS_INFORMATION& pi)
 
 Now we have a fully functionnal code that allows us to execute any PE through process hollowing technic. But, we would like now to retrieve the output directly in our program.
 
-## Final Touch: Retrieve output of our injected process
+# Final Touch: Retrieve output of our injected process
 
 Windows created `pipes` which is a mechanism used to create interprocess communication. Therefore, we can redirect `stdOut` and `stdErr` to the created anonymous pipe and then read it.  
 First we will modify our `launchSuspendedProcess`.
@@ -1354,7 +1353,7 @@ int main(int argc, char** argv)
 
 We finally have a fully PE runner in a remote process and we can retrieve the output. 
 
-## Plot Twist
+# Plot Twist
 
 Recently [maldev academy](https://maldevacademy.com/new/modules/38) published an update where they also perform process hollowing. However by reading it, I realized that if we copy our PE at its prefered image base address contained in its NT Header, we do not need to perform relocation nor IAT patching.   
 
@@ -1362,7 +1361,7 @@ However, this technic allows to learn more about how the libraries are loaded in
 
 Hope you enjoyed it and learned something in this ~~too~~ long blog post.
 
-## References
+# References
 
 * [ired.team](https://www.ired.team) that allowed me to learn about basic process hollowing
 * [maldev academy](https://maldevacademy.com/) that allowed me to learn about API Set names
