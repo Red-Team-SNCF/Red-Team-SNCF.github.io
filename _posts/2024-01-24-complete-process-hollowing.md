@@ -1355,9 +1355,21 @@ We finally have a fully PE runner in a remote process and we can retrieve the ou
 
 # Plot Twist
 
+## Plot Twist 1
+
 Recently [maldev academy](https://maldevacademy.com/new/modules/38) published an update where they also perform process hollowing. However by reading it, I realized that if we copy our PE at its prefered image base address contained in its NT Header, we do not need to perform relocation nor IAT patching.   
 
-However, this technic allows to learn more about how the libraries are loaded in a process. Also, by using this technic, you can only copy the PE sections without the headers (header stomping). And you can avoid memory pages overlap by not forcing the address of the allocation.
+## Plot Twist 2
+
+After talking with snow ([@never_unsealed](https://x.com/never_unsealed)). Thanks to him I found out that it was not even needed to copy our PE at its prefered image base address. It is just needed to update the Image Base Address in the PEB structure of the remote process. It is also needed to create the remote process with the flag `CREATE_NEW_CONSOLE` which spawns a child process `conhost.exe` (`CREATE_SUSPENDED|CREATE_NEW_CONSOLE`). After that the Windows loader will do everything for us.
+
+## Let's put things into perspective
+
+This technic allows to learn more about how the libraries are loaded in a process (Forwarded Functions / API Sets / Functions and libraries resolution on a remote process).  
+Also, by using this technic:
+* you can only copy the PE sections without the headers (header stomping). 
+* you can avoid memory pages overlap by not forcing the address of the allocation.
+* you can retrieve the output without the remote process creating a child process "conhost.exe". (you can create your suspended process with only the flag `CREATE_SUSPENDED`)
 
 Hope you enjoyed it and learned something in this ~~too~~ long blog post.
 
