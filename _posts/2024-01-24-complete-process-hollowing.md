@@ -8,7 +8,6 @@ description: A blog post to explain how we can perform process hollowing with IA
 img: posts/20240124/ProcessHollowing.jpg 
 tags: [Code injection, Coding, Malware Developpement, Windows]
 author: ZkClown
-github:  Red-Team-SNCF/Complete-Process-Hollowing
 mathjax: yes
 ---
 
