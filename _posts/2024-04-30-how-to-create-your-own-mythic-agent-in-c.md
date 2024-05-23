@@ -3,7 +3,7 @@ layout: post
 read_time: true
 show_date: true
 title:  How to create your own mythic agent in C
-date:   2024-04-01 8:00:00 -0100
+date:   2024-05-23 8:00:00 -0100
 description: A blog post to explain how to create a mythic agent with low level language like C.
 img: posts/20240430/mythic.png 
 tags: [Code injection, Coding, Malware Developpement, Windows]
