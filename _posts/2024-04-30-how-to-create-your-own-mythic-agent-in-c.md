@@ -80,11 +80,11 @@ cd Mythic
 sudo make
 sudo mythic-cli start
 {% endhighlight %}
-Once the installation done, we can connect on the frontend of our Mythic instance on `https://127.0.0.1:7443`. (The credentials are stored in the file `.env` in out mythic folder)
+Once the installation done, we can connect on the frontend of our Mythic instance on `https://127.0.0.1:7443`. (The credentials are stored in the file `.env` in mythic folder)
 
 ![Mythic fresh install](assets/img/posts/20240430/mythic_fresh.png)
 
-Once installed, our mythic server has no listener and no agents. So first, we need to install the HTTP listener provided by Mythic.
+Once installed, our mythic server has no listener and no agent. So first, we need to install the HTTP listener provided by Mythic.
 {% highlight bash %}
 sudo ./mythic-cli install github https://github.com/MythicC2Profiles/http
 {% endhighlight %}
@@ -118,11 +118,11 @@ However, we will only need the folder `Payload_Type` and can therefore remove th
 }
 {% endhighlight %}
 In the `Payload_Type` folder, we have two folders `python_services` and `go_services`. 
-Each one implement the same services but one is written in golang and the other one in python. For this article, we will use python, so let's delete the `go_services` folder, since we won't actually use it.
+Each one implements the same services but one is written in golang and the other one in python. For this article, we will use python, so let's delete the `go_services` folder, since we won't actually use it.
 
 ![Python services content](assets/img/posts/20240430/python_service.png)
 
-Here we have multiple folder for multiple services. Since we only want to have only an agent and its translator, we will remove all the others folders to keep only `basic_python_agent` and `translator`.
+Here we have multiple folders for multiple services. Since we only want to have only an agent and its translator, we will remove all the others folders to keep only `basic_python_agent` and `translator`.
 
 To have our two services running with Mythic, we need to uncomment the import of the translator in the `main.py` file.
 {% highlight python %}
@@ -155,7 +155,7 @@ For this blog post, we will have one container with the translator and our agent
 ### Agent side
 
 When we look inside the `basic_python_agent`, we have 3 folders:
-* agent_code: the folder will contain all the agent code that will be used when the server will compile a agent.
+* agent_code: the folder will contain all the agent code that will be used when the server will compile an agent.
 * agent_function: the folder will contain everything related to our agent but server side. It has one common `.py` file which is `builder.py`. It is used to declare a class that will represent our agent and all the building steps to generate our agent. The folder also has one `.py` file for each command we want to have for our agent. We'll have to create one of those later.
 * browser_script: this folder will contain `.js` files used if we want to customise some command behavior. (eg: having a beautiful view when performing `ls` command). However we won't use it for this blog post.
 
