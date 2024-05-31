@@ -532,6 +532,9 @@ typedef struct
     BOOL isSSL;
     BOOL isProxyEnabled;
     PWCHAR proxyURL;
+
+    
+    UINT32 sleeptime;
 } CONFIG_CEOS, * PCONFIG_CEOS;
 
 extern PCONFIG_CEOS ceosConfig;
@@ -548,6 +551,7 @@ ceosConfig->httpMethod = (PWCHAR)httpmethod;
 ceosConfig->isSSL = ssl;
 ceosConfig->isProxyEnabled = proxyenabled;
 ceosConfig->proxyURL = (PWCHAR)proxyurl;
+ceosConfig->sleeptime = sleep_time;
 {% endhighlight %}
 
 Eventhough the configuration does not account for a lot at the moment, one may use and update this structure according to their needs and store complex objects within it. 
