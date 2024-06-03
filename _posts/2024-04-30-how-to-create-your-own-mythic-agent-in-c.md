@@ -635,6 +635,26 @@ Parser* sendAndReceive(PBYTE data, SIZE_T size)
 }
 {% endhighlight %}
 
+Also, Mythic need to receive B64 data. Therefore, we have created a function that allows to encode and send the packages.
+
+{% highlight C++ %}
+PParser sendPackage(PPackage package)
+{
+	PCHAR packetToSend = b64Encode((const unsigned char*)package->buffer, package->length);
+	SIZE_T sizePacketToSend = b64EncodedSize(package->length);
+
+	PParser response = sendAndReceive((PBYTE)packetToSend, sizePacketToSend);
+
+	if (!response)
+	{
+		packetToSend = nullptr;
+		return nullptr;
+	}
+		
+	return response;
+}
+{% endhighlight %}
+
 # Implementing the Check In
 
 Our agent is now able to send HTTP requests to our C2 server, we now want it to checkin !
