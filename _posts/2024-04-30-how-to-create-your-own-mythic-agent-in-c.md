@@ -635,7 +635,7 @@ Parser* sendAndReceive(PBYTE data, SIZE_T size)
 }
 {% endhighlight %}
 
-Also, Mythic need to receive B64 data. Therefore, we have created a function that allows to encode and send the packages.
+Also, Mythic needs to receive B64 data. Therefore, we have created a function that allows to encode and to send the packages.
 
 {% highlight C++ %}
 PParser sendPackage(PPackage package)
@@ -654,6 +654,8 @@ PParser sendPackage(PPackage package)
 	return response;
 }
 {% endhighlight %}
+
+To sumup, Mythic waits data in form B64(UUID + DATA_HANDLED_BY_TRANSLATOR)
 
 # Implementing the Check In
 
