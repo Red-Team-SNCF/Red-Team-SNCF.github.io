@@ -45,7 +45,6 @@ mathjax: yes
             * [Step 4: Requesting a Certificate](#step-4-requesting-a-certificate)
             * [Step 5: Authenticating and Escalating](#step-5-authenticating-and-escalating)
 * [Final Thoughts](#final-thoughts)
-* [References](#references)
 
 # 1. Introduction <a id="introduction"></a>
 
@@ -84,9 +83,9 @@ The lab setup:
 
 First of all, I need access to `domain-a.local`. Whether it's through phishing or an exploited vulnerability, we'll assume that I've been able to obtain initial access and then the credentials for account `admin-a@domain-a.local`. 
 
-## Step 2: Extracting the Trust Account <a id="step-2-extraction-the-trust-account"></a>
+## Step 2: Extracting the Trust Account <a id="step-2-extracting-the-trust-account"></a>
 
-### **2.1 Confirm the Trust Exists**  <a id="2.1"></a>
+### **2.1 Confirm the Trust Exists**  <a id="confirm-the-trust-exists"></a>
 
 First, I confirmed the outbound trust with a PowerShell cmdlet:
 ```powershell
@@ -96,7 +95,7 @@ Get-ADTrust -Filter * | Select Direction, Source, Target
 
 The output revealed the trust relationship between `domain-a.local` and `domain-b.local`.
 
-### 2.2 Find the Trust Object <a id="2.2"></a>
+### 2.2 Find the Trust Object <a id="find-the-trust-object"></a>
 
 I then searched for the trust object via LDAP to find its GUID:
 
@@ -105,7 +104,7 @@ Get-ADObject -LDAPFilter "(objectCategory=trustedDomain)"
 ```
 ![Trust Object](assets/img/posts/20250325/trust-object.png)
 
-### **2.3.1 Extract the Trust Account Hash**  <a id="2.3.1"></a>
+### **2.3.1 Extract the Trust Account Hash**  <a id="extract-the-trust-account-hash"></a>
 
 With the GUID in hand, it was time to use **[Mimikatz](https://github.com/gentilkiwi/mimikatz)**. So, I launched a **[DCSync](https://www.thehacker.recipes/ad/movement/credentials/dumping/dcsync)** attack to extract the NT hash of the trust account:
 ```cmd
@@ -120,7 +119,7 @@ The `[OUT]` hash was what I needed. Once recovered, I used **Rubeus** to request
 ![TGT Obtained](assets/img/posts/20250325/tgt-obtained.png)
 This step enabled me to impersonate the trust account in `domain-b.local`, setting the stage for privilege escalation.
 
-### **2.3.2 Alternate Method: Dump It From Memory**  <a id="2.3.2"></a>
+### **2.3.2 Alternate Method: Dump It From Memory**  <a id="alternate-method-dump-it-from-memory"></a>
 
 For those who like to take risks, there is an alternative method which consists of extracting the hash of the trust account from the Domain Controller's memory:
 ```cmd
@@ -129,7 +128,7 @@ mimikatz lsadump::trust /patch
 
 This is a [riskier approach](https://www.ired.team/offensive-security-experiments/active-directory-kerberos-abuse/abusing-trust-accountusd-accessing-resources-on-a-trusted-domain-from-a-trusting-domain), as it involves patching the memory, but it’s good to have options .
 
-### **2.4 Accessing Resources in `domain-b.local`**  <a id="2.4"></a>
+### **2.4 Accessing Resources in `domain-b.local`**  <a id="accessing-resources-in-domain-b-local"></a>
 
 With the TGT injected, I tried to get the `domain-b.local` information to confirm that the authentication was working:
 ```powershell
@@ -143,7 +142,7 @@ I was officially inside `domain-b.local`.
 
 The next step was to target **Active Directory Certificate Services (AD CS)** in `domain-b.local`. A misconfiguration in a template can enable a user to request a certificate for another user and thus perform a privilege escalation. **[ESC1](https://book.hacktricks.xyz/windows-hardening/active-directory-methodology/ad-certificates/domain-escalation#misconfigured-certificate-templates-esc1)** is a good example:
 
-### 3.1 Certify on Windows: The DIY Method <a id="3.1"></a>
+### 3.1 Certify on Windows: The DIY Method <a id="certify-on-windows-the-diy-method"></a>
 
 We're going to start with the most problematic but also the most famous AD CS exploitation tool for Windows, **[Certify](https://github.com/GhostPack/Certify)**.
 But we're going to see that in certain contexts, using it can be a challenge.
@@ -152,7 +151,7 @@ But we're going to see that in certain contexts, using it can be a challenge.
 
 After running a number of tests, I discovered that Certify has trouble working from a host outside the domain. I'll start by showing the cases where I was unable to obtain a certificate:
 
-##### Not Working Case 1: Using a Non-Domain-Joined Machine with an Injected TGT <a id="not-wirking-case-1"></a>
+##### Not Working Case 1: Using a Non-Domain-Joined Machine with an Injected TGT <a id="not-working-case-1"></a>
 
 For the first case, I'll try to obtain a certificate via my Windows 11 host outside the domain.
 
@@ -254,7 +253,7 @@ Using the context of a user from domain `domain-b.local` solved the NTLM authent
 Despite these failures, there is still one case where Certify is able to obtain a certificate with the trust account. But this will require pivoting to `DC01.domain-a.local`. Using Cetify directly from the domain controller allowed me to bypass the problems I had from a machine not attached to the domain. This blog post does not cover pivoting methods or bypassing AV/EDR systems, as I assume those are already handled.
 
 #### The Working Case: <a id="the-working-case"></a>
-##### Step 1: Enumerating Vulnerable Templates <a id="step-1-enumerationg-vulnerable-templates"></a>
+##### Step 1: Enumerating Vulnerable Templates <a id="step-1-enumerating-vulnerable-templates"></a>
 
 From `DC01.domain-a.local`, I needed to inject a TGT for the trust account:
 
@@ -342,7 +341,7 @@ Whether you want to use it with a dotnet loader or just because you prefer to us
 This just goes to show how important it is to adapt your tools to the scenarios you face.
 
 
-### 3.2 Certipy on Linux: The Simplified Approach <a id="3.2"></a>
+### 3.2 Certipy on Linux: The Simplified Approach <a id="certipy-on-linux-the-simplified-approach"></a>
 
 For those who prefer to work with Linux, **[Certipy](https://github.com/ly4k/Certipy)** is a game-changer. This tool simplifies the exploitation of AD CS vulnerabilities, and is perfectly compatible with Kerberos. Here's how I used Certipy to identify and exploit a configuration flaw in a template in `domain-b.local`.
 
@@ -390,7 +389,7 @@ The certificate request was a success, giving me a certificate tied to the domai
 
 #### Step 5: Authenticating and Escalating <a id="step-5-authentificating-and-escalating"></a>
 
-Using the obtained certificate, Certipy allowed me to authenticate as `administrator@domain-b.local`, to request a TGT and then to **[UnPac the hash]([https://www.thehacker.recipes/ad/movement/kerberos/unpac-the-hash])** for the `administrator` account.
+Using the obtained certificate, Certipy allowed me to authenticate as `administrator@domain-b.local`, to request a TGT and then to **[UnPac the hash](https://www.thehacker.recipes/ad/movement/kerberos/unpac-the-hash)** for the `administrator` account.
 ```bash
 certipy-ad auth -dc-ip 192.168.1.202 -pfx 'administrator.pfx' -username 'administrator' -domain 'domain-b.local'
 ```
