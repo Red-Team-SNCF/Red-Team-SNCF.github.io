@@ -358,7 +358,7 @@ export KRB5CCNAME=[PATH]/ticket.ccache
 
 #### Step 2: Validating the Ticket <a id="step-2-validating-the-ticket"></a>
 
-Before diving deeper, I checked that the TGT was valid by authenticating to `domain-b.local` using **[NetExec]([https://github.com/Pennyw0rth/NetExec])** :
+Before diving deeper, I checked that the TGT was valid by authenticating to `domain-b.local` using **[NetExec](https://github.com/Pennyw0rth/NetExec)** :
 
 ![Certipy Tgt Validation](assets/img/posts/20250325/Certipy-TGT-Validation.png)
 
