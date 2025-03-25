@@ -4,7 +4,7 @@ read_time: true
 show_date: true
 title: Outbound Trusts, AD CS, and Tool Adaptation, Adventures in Cross-Domain Pivoting
 date: 2025-03-25 8:00:00 -0100
-description: A blog post to explain how we can perform cross-domain pivoting through an outbound trusts.
+description: A blog post to explain how we can perform cross-domain pivoting through an outbound trust.
 img: posts/20250325/ad-red-team.jpeg
 tags: [Red Team, Windows, Pivoting, AD CS, Active Directory]
 author: Dram4ck
