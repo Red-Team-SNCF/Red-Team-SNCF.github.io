@@ -46,7 +46,7 @@ mathjax: yes
             * [Step 5: Authenticating and Escalating](#step-5-authenticating-and-escalating)
 * [Final Thoughts](#final-thoughts)
 
-# 1. Introduction <a id="introduction"></a>
+# Introduction <a id="introduction"></a>
 
 In Active Directory environments, [trust relationships](https://learn.microsoft.com/en-us/entra/identity/domain-services/concepts-forest-trust#trust-relationship-flows) enable multiple domains to work together, allowing authentication and access to other domain's resources seamlessly. But what happens if this link becomes a vulnerability? That's exactly what this blog post is intended to cover: Using an outbound trust relationship to pivot from a compromised domain to a second domain, ultimately compromising it with a misconfiguration in an Active Directory Certificate Services (AD CS) template.
 
@@ -57,7 +57,7 @@ Whether you're a Red Teamer looking for new methods or a Blue Teamer wanting to 
 
 
 ---
-# 2. Setting the Scene <a id="setting-the-scene"></a>
+# Setting the Scene <a id="setting-the-scene"></a>
 
 So let's put it on stage:
 
@@ -77,7 +77,7 @@ The lab setup:
 **The goal ?** Leverage the trust account used to manage the outbound relationship and pivot into `domain-b.local`.
 
 ---
-# 3. Steps to Victory <a id="steps-to-victory"></a>
+# Steps to Victory <a id="steps-to-victory"></a>
 
 ## Step 1: Getting a Foothold <a id="step-1-getting-a-foothold"></a>
 
@@ -398,7 +398,7 @@ If you’re looking for efficiency, Certipy should be part of your toolkit.
 
 ---
 
-# 4. Final Thoughts <a id="final-thoughts"></a>
+# Final Thoughts <a id="final-thoughts"></a>
 
 What started out as a simple question "**_Why does Certify fail from a non-domain-joined machine to exploit through an outbound trust ?_**" evolved into a deeper exploration of how Active Directory works. Through this, I was able to highlight how a trust account can interact with domain services, dig into authentication concerns with NTLM and Kerberos as well as learn to understand the problems associated with tools such as Certify and Certipy.
 
